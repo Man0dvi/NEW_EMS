@@ -1,0 +1,6 @@
+employee_id,name,email,phone_number,department,join_date
+1,"John Doe","john.doe@example.com","123-456-7890","HR","2022-01-01"
+2,"Jane Smith","jane.smith@example.com","234-567-8901","Finance","2022-01-05"
+3,"Michael Johnson","michael.johnson@example.com","345-678-9012","Engineering","2022-01-10"
+4,"Emily Brown","emily.brown@example.com","456-789-0123","Marketing","2022-01-15"
+5,"David Wilson","david.wilson@example.com","567-890-1234","Operations","2022-01-20"

@@ -1,3 +1,27 @@
+# analysis_server.py
+from fastmcp import FastMCP
+from typing import List, Dict, Any
+
+# --- Libraries for Analysis Tools ---
+import pandas as pd
+import numpy as np
+from sentence_transformers import SentenceTransformer
+from sklearn.metrics.pairwise import cosine_similarity
+from datetime import datetime
+
+# Initialize the FastMCP Server. This object holds the @mcp.tool decorator.
+mcp = FastMCP(
+    name="DeepAnalysisAgent", 
+    instructions="Performs complex reasoning, comparison, trend, and statistical analysis on retrieved document chunks.",
+    dependencies=["pandas", "numpy", "sentence-transformers", "scikit-learn"]
+)
+
+# --- Global Resources (Loaded once on server startup) ---
+# NOTE: In a production FastMCP server, model loading might be handled 
+# in a lifespan hook or within the tool itself for lazy loading.
+EMBEDDING_MODEL = SentenceTransformer('all-MiniLM-L6-v2') 
+SIMILARITY_THRESHOLD = 0.85
+
 @mcp.tool
 def comparative_analysis_tool(
     knowledge_base: List[Dict[str, Any]], 
@@ -190,3 +214,4 @@ def statistical_analysis_tool(knowledge_base: List[Dict[str, Any]], metric_name:
         "minimum": f"{np.min(data):.2f}",
         "maximum": f"{np.max(data):.2f}"
     }
+

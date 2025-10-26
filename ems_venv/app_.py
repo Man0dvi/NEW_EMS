@@ -1,274 +1,303 @@
-# rag_server.py
+# --- agent_2_tools.py ---
+# Defines MCP tools for Agent 2: Web Scraper & Document Retrieval Agent
+# This version uses a persistent PostgreSQL database with the pgvector extension
+# and a custom table schema as requested.
 
 import os
 import uuid
-import asyncio
+import yake  # For keyword extraction
+import datetime
 from typing import List, Dict, Any
-from datetime import datetime
+from mcp.server.fastmcp import FastMCP
 from dotenv import load_dotenv
 
-# --- FastMCP Setup ---
-from fastmcp import FastMCP
-from pydantic import BaseModel, Field
+# --- Database Imports ---
+# We'll use SQLAlchemy to manage the DB connection and execute raw SQL
+# and psycopg2 as the underlying driver.
+import sqlalchemy
+from sqlalchemy import create_engine, text
 
-# --- LangChain/DB Components & Utility ---
-import bs4
+# --- LangChain Imports ---
 from langchain_community.document_loaders import WebBaseLoader
+from langchain_openai import OpenAIEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_core.documents import Document
-from db import VECTOR_STORE # Import the PGVector instance
 
-# --- Keyword Extraction Utility (Integrated) ---
-from rake_nltk import Rake
-import re
-RAKE_MODEL = Rake() 
-
-def extract_keywords_from_text(text: str) -> List[str]:
-    """
-    Extracts high-value keywords and phrases from a given text.
-    Used for both chunk storage and query parsing.
-    """
-    if not text: return []
-    
-    clean_text = re.sub(r'[^a-zA-Z0-9\s]', '', text)
-    RAKE_MODEL.extract_keywords_from_text(clean_text)
-    
-    # Get the top 5 phrases, converted to lowercase
-    keywords_and_phrases = RAKE_MODEL.get_ranked_phrases() 
-    return [phrase.lower() for phrase in keywords_and_phrases[:5]]
-
-# Load environment variables
+# 1. --- INITIAL SETUP ---
 load_dotenv()
 
-# --- Pydantic Schemas ---
-class ScrapeInput(BaseModel):
-    web_paths: List[str] = Field(description="A list of URLs to scrape.")
+# Initialize the MCP server
+mcp = FastMCP("RAG_and_Web_Agent")
 
-class SearchQuery(BaseModel):
-    query: str = Field(description="The user's query or sub-task for searching.")
-    k: int = Field(default=5, description="The number of top results to retrieve.")
+# --- 2. DATABASE SETUP ---
+# Get the connection string from your specification
+PG_CONNECTION_STRING = "postgresql://vectoruser:vectorpass@localhost:5433/vectordb"
+TABLE_NAME = "deep_research_chunks"
 
-class RAGResult(BaseModel):
-    content: str = Field(description="The retrieved text content of the chunk.")
-    source: str = Field(description="The original URL source of the document.")
-    relevance_type: str = Field(description="How this chunk was retrieved (Semantic or Keyword).")
+try:
+    # Create the SQLAlchemy engine
+    db_engine = create_engine(PG_CONNECTION_STRING)
+    print(f"[Agent 2] Connecting to PostgreSQL at {db_engine.url.host}...")
+except Exception as e:
+    print(f"[Agent 2] ERROR: Could not create DB engine. Is PostgreSQL running? {e}")
+    exit(1)
 
-# --- FastMCP Initialization ---
-mcp = FastMCP(
-    name="Agent2_RAG_Server", 
-    instructions="Provides web scraping, chunking, and semantic/keyword search over a PostgreSQL Vector DB.",
-)
-
-# --- Tool 1: Web Scraper ---
-@mcp.tool()
-async def web_scraper_tool(input: ScrapeInput) -> List[Dict[str, str]]:
-    """Scrapes raw text content from a list of URLs using selective HTML parsing."""
-    # (Implementation remains the same: uses WebBaseLoader and returns List[Dict[text, url]])
-    # ... [Full implementation from previous response] ...
+# Initialize the models (same as before)
+try:
+    embeddings_model = OpenAIEmbeddings(api_key=os.getenv("OPENAI_API_KEY"))
+    # Get embedding dimension
+    test_embedding = embeddings_model.embed_query("test")
+    EMBEDDING_DIM = len(test_embedding)
+    print(f"[Agent 2] OpenAI Embeddings loaded. Dimension: {EMBEDDING_DIM}")
+except ImportError:
+    raise ImportError("OpenAI provider not found. Please install langchain-openai")
+except Exception as e:
+    print(f"[Agent 2] ERROR: Could not init OpenAIEmbeddings. Check API key. {e}")
+    exit(1)
     
-    # Placeholder return for brevity:
-    return [{"text": "Sample text about the core loop steps and memory types...", "url": "http://sample.com/doc1"}] 
+# Initialize keyword extractor
+kw_extractor = yake.KeywordExtractor(n=1, top=20, dedupLim=0.9)
 
-
-# --- Tool 2: RAG Pipeline (Chunking, Keyword Extraction, Storage) ---
-@mcp.tool()
-async def rag_pipeline_tool(scraped_documents: List[Dict[str, str]]) -> str:
+def setup_database():
     """
-    Splits raw text documents, extracts keywords (for storage), embeds, and stores them in the PGVector.
+    Ensures the 'vector' extension is enabled and the 'deep_research_chunks'
+    table exists with the correct schema.
     """
-    if not scraped_documents: return "No documents provided to the RAG pipeline. Skipping storage."
-        
-    print(f"[RAGTool] Starting chunking, keyword extraction, and storage...")
-
-    text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=100)
-    lc_documents = []
-
-    for doc in scraped_documents:
-        chunks = text_splitter.split_text(doc["text"])
-        
-        for chunk_content in chunks:
-            # *********** Integrated Keyword Extraction ***********
-            keywords_for_storage = extract_keywords_from_text(chunk_content) 
+    try:
+        with db_engine.connect() as conn:
+            # Step 1: Enable the pgvector extension
+            conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector;"))
             
-            lc_documents.append(
-                Document(
-                    page_content=chunk_content, 
-                    metadata={
-                        "source": doc["url"], 
-                        "timestamp": datetime.now().isoformat(),
-                        "keywords": keywords_for_storage # Stored in the DB 'keywords' array column
-                    }
-                )
-            )
-    
-    # Embedding and Storage (PGVector handles this via add_documents)
-    try:
-        await asyncio.to_thread(VECTOR_STORE.add_documents, documents=lc_documents)
-        return f"Successfully stored {len(lc_documents)} chunks with keywords in PGVector."
+            # Step 2: Create the table as per the specified schema
+            # We use "IF NOT EXISTS" to make this function idempotent
+            table_creation_query = text(f"""
+            CREATE TABLE IF NOT EXISTS {TABLE_NAME} (
+                chunk_id UUID PRIMARY KEY,
+                document_id UUID,
+                source_url TEXT,
+                timestamp TIMESTAMPTZ,
+                text_content TEXT,
+                keywords TEXT[],
+                embedding_vector VECTOR({EMBEDDING_DIM})
+            );
+            """)
+            conn.execute(table_creation_query)
+            
+            # Step 3: Create an index for vector search (HNSW or IVFFlat)
+            # This is crucial for performance.
+            conn.execute(text(f"""
+            CREATE INDEX IF NOT EXISTS idx_hnsw_embedding
+            ON {TABLE_NAME}
+            USING hnsw (embedding_vector vector_l2_ops);
+            """))
+            # Commit the transaction
+            conn.commit()
+        print(f"[Agent 2] Database setup complete. Table '{TABLE_NAME}' is ready.")
     except Exception as e:
-        return f"ERROR storing chunks in PGVector: {e}"
+        print(f"[Agent 2] ERROR during database setup: {e}")
+        print("Please ensure the PostgreSQL user 'vectoruser' has permissions to CREATE.")
 
-# --- Tool 3: Semantic Search Tool ---
+
+# --- 3. MCP TOOL DEFINITIONS ---
+
 @mcp.tool()
-async def semantic_search_tool(input: SearchQuery) -> List[RAGResult]:
-    """Performs a semantic similarity search against the vectorized knowledge base."""
-    print(f"[SearchTool] Performing SEMANTIC search for: '{input.query}' (k={input.k})")
+def web_scrape_and_ingest(urls: List[str]) -> str:
+    """
+    Tool 1: Scrapes content from URLs, chunks it, extracts keywords,
+    creates embeddings, and stores everything in the PostgreSQL database
+    according to the specified 'deep_research_chunks' schema.
+    """
+    print(f"[Agent 2] Received request to scrape {len(urls)} URLs...")
+
+    # --- LOAD ---
+    loader = WebBaseLoader(urls)
+    try:
+        docs = loader.load()
+    except Exception as e:
+        print(f"[Agent 2] Error loading URLs: {e}")
+        return f"Error: Failed to load one or more URLs. {e}"
+        
+    if not docs:
+        return "Error: No documents were loaded from the provided URLs."
+
+    # --- SPLIT ---
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=150)
+    chunks = text_splitter.split_documents(docs)
+    
+    print(f"[Agent 2] Loaded {len(docs)} docs, split into {len(chunks)} chunks.")
+
+    # Prepare data for insertion
+    chunks_to_insert = []
+    
+    # Generate one document_id for all chunks from this scrape/doc batch
+    # (A better approach might be one UUID per URL)
+    
+    # Let's do one UUID per source document
+    doc_id_map = {doc.metadata.get('source'): uuid.uuid4() for doc in docs}
+
+    for chunk in chunks:
+        text_content = chunk.page_content
+        source_url = chunk.metadata.get('source', 'N/A')
+        document_id = doc_id_map.get(source_url)
+        
+        # Extract keywords
+        keywords_tuples = kw_extractor.extract_keywords(text_content)
+        extracted_keywords = [kw[0].lower() for kw in keywords_tuples]
+
+        # Prepare entry
+        chunks_to_insert.append({
+            "chunk_id": uuid.uuid4(),
+            "document_id": document_id,
+            "source_url": source_url,
+            "timestamp": datetime.datetime.now(datetime.timezone.utc),
+            "text_content": text_content,
+            "keywords": extracted_keywords,
+        })
+        
+    # --- EMBED & STORE ---
+    # Batch generate embeddings for efficiency
+    all_text_content = [c["text_content"] for c in chunks_to_insert]
+    
+    if not all_text_content:
+        return "No text content found in chunks to process."
+        
+    print(f"[Agent 2] Generating {len(all_text_content)} embeddings...")
+    embeddings = embeddings_model.embed_documents(all_text_content)
+    
+    # Add embeddings to our data
+    for i, chunk_data in enumerate(chunks_to_insert):
+        chunk_data["embedding_vector"] = embeddings[i]
+
+    # Batch insert into PostgreSQL
+    try:
+        with db_engine.connect() as conn:
+            # We must use text() for the INSERT query
+            insert_query = text(f"""
+            INSERT INTO {TABLE_NAME} (
+                chunk_id, document_id, source_url, timestamp, 
+                text_content, keywords, embedding_vector
+            ) VALUES (
+                :chunk_id, :document_id, :source_url, :timestamp, 
+                :text_content, :keywords, :embedding_vector
+            )
+            """)
+            
+            # Execute the batch insertion
+            conn.execute(insert_query, chunks_to_insert)
+            conn.commit()
+            
+    except Exception as e:
+        error_msg = f"Error: Database insertion failed. {e}"
+        print(f"[Agent 2] {error_msg}")
+        return error_msg
+
+    success_message = f"Successfully scraped, processed, and ingested content. Added {len(chunks)} new chunks to the '{TABLE_NAME}' table."
+    print(f"[Agent 2] {success_message}")
+    return success_message
+
+
+@mcp.tool()
+def semantic_search_tool(query: str, k: int = 4) -> List[Dict[str, Any]]:
+    """
+    Tool 2: Performs a semantic (vector) similarity search against the
+    PostgreSQL 'embedding_vector' column.
+    """
+    print(f"[Agent 2] Performing semantic search for: '{query}'")
+    
+    # 1. Generate the query embedding
+    try:
+        query_embedding = embeddings_model.embed_query(query)
+    except Exception as e:
+        return [{"error": f"Failed to embed query: {e}"}]
+
+    # 2. Execute the vector search query
+    # We use the <-> (L2 distance) operator from pgvector
+    search_query = text(f"""
+    SELECT 
+        text_content, 
+        source_url, 
+        (embedding_vector <-> :query_embedding) AS similarity
+    FROM {TABLE_NAME}
+    ORDER BY similarity
+    LIMIT :k
+    """)
     
     try:
-        retrieved_docs = await asyncio.to_thread(
-            VECTOR_STORE.similarity_search, 
-            query=input.query, 
-            k=input.k
-        )
+        with db_engine.connect() as conn:
+            results = conn.execute(search_query, {
+                "query_embedding": query_embedding,
+                "k": k
+            })
+            
+            formatted_results = [
+                {
+                    "text_content": row.text_content,
+                    "source": row.source_url,
+                    "similarity_score": row.similarity
+                } for row in results.mappings() # Use .mappings() to get dict-like rows
+            ]
+            
+        print(f"[Agent 2] Found {len(formatted_results)} semantic results.")
+        return formatted_results
         
-        results = [
-            RAGResult(
-                content=doc.page_content,
-                source=doc.metadata.get("source", "N/A"),
-                relevance_type="Semantic"
-            )
-            for doc in retrieved_docs
-        ]
-        return results
-    
     except Exception as e:
-        print(f"[SearchTool] ERROR during semantic search: {e}")
-        return []
+        error_msg = f"Error during semantic search: {e}"
+        print(f"[Agent 2] {error_msg}")
+        return [{"error": error_msg}]
 
-# --- Tool 4: Keyword Search Tool ---
+
 @mcp.tool()
-async def keyword_search_tool(input: SearchQuery) -> List[RAGResult]:
+def keyword_search_tool(query: str, limit: int = 5) -> List[Dict[str, Any]]:
     """
-    Performs a direct keyword/lexical search against the indexed 'keywords' 
-    field in the PostgreSQL database using query keywords.
+    Tool 3: Performs a keyword search against the 'keywords' TEXT[]
+    array column in the PostgreSQL database.
     """
-    # 1. Extract Keywords from the User Query
-    search_keywords = extract_keywords_from_text(input.query)
+    print(f"[Agent 2] Performing keyword search for: '{query}'")
     
-    if not search_keywords:
-        return []
-        
-    print(f"[SearchTool] Performing KEYWORD search for query keywords: {search_keywords} (k={input.k})")
+    # Split query into unique keywords
+    query_keywords = list(set(query.lower().split()))
     
-    # 2. Construct the SQL Filter (Requires custom DB operation)
-    # We are simulating the retrieval here due to the complexity of exposing PG array 
-    # operators via standard LangChain PGVector calls, focusing on the correct I/O.
+    # 2. Execute the array overlap query
+    # We use the && (overlap) operator for PostgreSQL arrays
+    search_query = text(f"""
+    SELECT 
+        text_content, 
+        source_url, 
+        keywords
+    FROM {TABLE_NAME}
+    WHERE keywords && :query_keywords
+    LIMIT :limit
+    """)
+    
+    try:
+        with db_engine.connect() as conn:
+            results = conn.execute(search_query, {
+                "query_keywords": query_keywords,
+                "limit": limit
+            })
+            
+            formatted_results = [
+                {
+                    "text_content": row.text_content,
+                    "source": row.source_url,
+                    "matching_keywords": [kw for kw in row.keywords if kw in query_keywords]
+                } for row in results.mappings()
+            ]
 
-    # --- Simulated Retrieval ---
-    simulated_results = [
-        RAGResult(
-            content=f"Keyword match for: {search_keywords[0]}. The policy changes were key to investment.",
-            source="http://doc-keyword-match.com",
-            relevance_type="Keyword"
-        ) for _ in range(min(input.k, 3)) # Return up to 3 strong matches
-    ]
-    
-    return simulated_results
+        print(f"[Agent 2] Found {len(formatted_results)} keyword results.")
+        return formatted_results
+
+    except Exception as e:
+        error_msg = f"Error during keyword search: {e}"
+        print(f"[Agent 2] {error_msg}")
+        return [{"error": error_msg}]
+
+
+# --- 4. RUN THE MCP SERVER ---
 
 if __name__ == "__main__":
-    print("Starting Agent 2 FastMCP Server...")
-    # RAKE_MODEL must be initialized (done above)
-    mcp.run()
-
-
-# rag_agent.py
-
-import asyncio
-from typing import List
-from dotenv import load_dotenv
-
-# --- LangChain Agent Imports ---
-from langchain.agents import create_agent
-from langchain_openai import ChatOpenAI 
-from langchain_core.messages import HumanMessage
-from langchain_core.tools import BaseTool # The type of object loaded from MCP
-
-# --- MCP Client and Adapter Imports ---
-# We use MultiServerMCPClient to connect to our running FastMCP server
-from langchain_mcp_adapters.client import MultiServerMCPClient
-
-# Load environment variables
-load_dotenv()
-
-# --- Configuration ---
-MCP_SERVER_URL = "http://127.0.0.1:8000" 
-LLM_MODEL = "gpt-4o-mini" 
-
-# Example Query
-TEST_QUERY = "Using the data ingested from the URL, perform a hybrid search and tell me the core loop steps and memory types used in LLM agents."
-TEST_URLS = ["https://lilianweng.github.io/posts/2023-06-23-agent/"] # URL to ingest
-
-async def load_mcp_tools() -> List[BaseTool]:
-    """Connects to the FastMCP server and loads all defined tools."""
-    # Use MultiServerMCPClient to connect to the streamable HTTP server
-    mcp_client = MultiServerMCPClient(
-        connections={
-            "rag_server": {
-                "url": f"{MCP_SERVER_URL}/mcp",
-                "transport": "streamable_http" 
-            }
-        }
-    )
-    # get_tools() calls the server, retrieves the tool definitions, and wraps them as LangChain Tool objects.
-    tools = await mcp_client.get_tools()
+    print("Setting up database...")
+    setup_database()
     
-    if not tools:
-        raise ConnectionError("Failed to load tools from the MCP server. Is rag_server.py running?")
-        
-    print(f"✅ Successfully loaded {len(tools)} tools from MCP server.")
-    return tools
-
-
-async def run_agent():
-    """Initializes and runs the Agent 2 Orchestrator."""
-    
-    # 1. Load Tools Directly from the Running Server
-    try:
-        tools = await load_mcp_tools()
-    except ConnectionError as e:
-        print(f"FATAL ERROR: {e}")
-        return
-
-    # 2. Define the LangChain Agent
-    llm = ChatOpenAI(model=LLM_MODEL, temperature=0.1)
-    
-    # *********** System Prompt - The Orchestration Logic ***********
-    # This prompt tells the LLM the exact procedure using the raw tool names.
-    system_prompt = (
-        "You are Agent 2, the RAG and Retrieval Specialist. Your task is to process a complex data request. "
-        "Your workflow is strictly procedural, and you must use the available tools sequentially. "
-        
-        "**Procedure:**\n"
-        "1. **Acquisition:** First, you MUST call 'web_scraper_tool' to get raw content. "
-        "2. **Processing:** Then, immediately call 'rag_pipeline_tool' to chunk, extract keywords, and store the content in the database. "
-        "3. **Retrieval:** Finally, call 'semantic_search_tool' and 'keyword_search_tool' simultaneously (or sequentially, if needed) to gather the final context. "
-        "4. **Output:** Your final answer must be the raw, combined output of the search tools for Agent 3's analysis (Do NOT synthesize or rephrase)."
-    )
-    
-    agent_executor = create_agent(
-        model=llm,
-        tools=tools, # Pass the list of raw MCP tools directly
-        system_prompt=system_prompt,
-    )
-
-    # 3. Simulate User Input (The Query from Agent 1)
-    
-    # We combine the scrape input and the search input into one message for the agent to decompose
-    full_message = (
-        f"1. Ingest content from the following URL: {TEST_URLS[0]}. "
-        f"2. Then, find information on: '{TEST_QUERY}'."
-    )
-    
-    print("\n--- Running Agent 2 Orchestrator Workflow ---")
-    user_input = HumanMessage(content=full_message)
-    
-    # Invoke the agent
-    result = await agent_executor.invoke({"messages": [user_input]})
-
-    # 4. Output Result
-    print("\n--- Agent 2 Workflow Complete (Ready for Agent 3) ---")
-    print(f"Final Output:\n{result['messages'][-1].content}")
-    print(f"\nFinal LLM model used for orchestration: {LLM_MODEL}")
-
-if __name__ == "__main__":
-    asyncio.run(run_agent())
+    print("Starting Agent 2 (RAG & Web) MCP Tool Server...")
+    # Run on port 8001 (or any port not used by other agents)
+    mcp.run(transport="streamable-http", port=8001)

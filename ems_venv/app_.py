@@ -1,303 +1,210 @@
-# --- agent_2_tools.py ---
-# Defines MCP tools for Agent 2: Web Scraper & Document Retrieval Agent
-# This version uses a persistent PostgreSQL database with the pgvector extension
-# and a custom table schema as requested.
+# --- graph_builder.py (Refactored for Single Server) ---
 
 import os
-import uuid
-import yake  # For keyword extraction
-import datetime
-from typing import List, Dict, Any
-from mcp.server.fastmcp import FastMCP
+import operator
+import json
+from typing import TypedDict, Annotated, Sequence, List, Dict, Any, Literal
 from dotenv import load_dotenv
 
-# --- Database Imports ---
-# We'll use SQLAlchemy to manage the DB connection and execute raw SQL
-# and psycopg2 as the underlying driver.
-import sqlalchemy
-from sqlalchemy import create_engine, text
+from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, ToolMessage, SystemMessage
+from langchain_openai import ChatOpenAI
+from langchain.tools import BaseTool
+from langgraph.graph import StateGraph, END
+from langgraph.prebuilt import ToolNode, tools_condition
 
-# --- LangChain Imports ---
-from langchain_community.document_loaders import WebBaseLoader
-from langchain_openai import OpenAIEmbeddings
-from langchain_text_splitters import RecursiveCharacterTextSplitter
+# Import the UPDATED agent runner tools
+from agent_runners import get_agent_runner_tools
 
-# 1. --- INITIAL SETUP ---
+# Import MCP client
+from langchain_mcp_adapters.client import MultiServerMCPClient
+
 load_dotenv()
 
-# Initialize the MCP server
-mcp = FastMCP("RAG_and_Web_Agent")
+# --- 1. Define Agent State (Unchanged) ---
+class AgentState(TypedDict):
+    messages: Annotated[Sequence[BaseMessage], operator.add]
+    original_query: str
+    sub_tasks: List[str]
+    completed_tasks: Annotated[List[str], operator.add]
+    task_results: Dict[str, List[Dict[str, Any]]]
 
-# --- 2. DATABASE SETUP ---
-# Get the connection string from your specification
-PG_CONNECTION_STRING = "postgresql://vectoruser:vectorpass@localhost:5433/vectordb"
-TABLE_NAME = "deep_research_chunks"
-
+# --- 2. Setup MCP Client for Agent 1's Internal Tools (Use Consolidated Client Config) ---
+SERVER_BASE_URL = os.getenv("ALL_TOOLS_URL", "http://localhost:8000")
 try:
-    # Create the SQLAlchemy engine
-    db_engine = create_engine(PG_CONNECTION_STRING)
-    print(f"[Agent 2] Connecting to PostgreSQL at {db_engine.url.host}...")
+    # This client connects ONLY to the Coordinator's namespace on the single server
+    agent_1_client = MultiServerMCPClient({
+        "Coordinator_Tools": { # Namespace must match FastMCP("Coordinator_Tools")
+            "transport": "streamable_http",
+            "url": f"{SERVER_BASE_URL}/coordinator/mcp" # Point to coordinator's mount path
+        }
+    })
+    print("[Graph Builder] Configured client for Agent 1 Tools (on consolidated server).")
 except Exception as e:
-    print(f"[Agent 2] ERROR: Could not create DB engine. Is PostgreSQL running? {e}")
-    exit(1)
+    print(f"[Graph Builder] ERROR configuring Agent 1 client: {e}")
+    agent_1_client = None
 
-# Initialize the models (same as before)
-try:
-    embeddings_model = OpenAIEmbeddings(api_key=os.getenv("OPENAI_API_KEY"))
-    # Get embedding dimension
-    test_embedding = embeddings_model.embed_query("test")
-    EMBEDDING_DIM = len(test_embedding)
-    print(f"[Agent 2] OpenAI Embeddings loaded. Dimension: {EMBEDDING_DIM}")
-except ImportError:
-    raise ImportError("OpenAI provider not found. Please install langchain-openai")
-except Exception as e:
-    print(f"[Agent 2] ERROR: Could not init OpenAIEmbeddings. Check API key. {e}")
-    exit(1)
-    
-# Initialize keyword extractor
-kw_extractor = yake.KeywordExtractor(n=1, top=20, dedupLim=0.9)
+# --- 3. Function to Fetch All Tools (Fetch internal tools + get runners) ---
+_coordinator_tools_cache = None
+async def get_coordinator_tools() -> List[BaseTool]:
+    """Fetches Agent 1's internal tools and combines with agent runners."""
+    global _coordinator_tools_cache
+    if _coordinator_tools_cache: return _coordinator_tools_cache
 
-def setup_database():
-    """
-    Ensures the 'vector' extension is enabled and the 'deep_research_chunks'
-    table exists with the correct schema.
-    """
+    internal_tools = []
+    if agent_1_client:
+        try:
+            # Fetch tools ONLY from the Coordinator_Tools namespace
+            internal_tools = await agent_1_client.get_tools(namespace="Coordinator_Tools")
+            print(f"[Graph Builder] Fetched {len(internal_tools)} internal tools for Agent 1.")
+        except Exception as e:
+            print(f"[Graph Builder] ERROR fetching Agent 1 internal tools: {e}")
+
+    # Combine internal tools with the imported agent runner tools
+    all_tools = internal_tools + get_agent_runner_tools()
+    print(f"[Graph Builder] Total tools available to coordinator: {[tool.name for tool in all_tools]}")
+    if not all_tools: print("[Graph Builder] WARNING: No tools loaded!")
+    _coordinator_tools_cache = all_tools
+    return all_tools
+
+# --- 4. Define Graph Nodes (decompose_query_node, process_tool_results_node, final_synthesis_answer_node are largely unchanged, but use correct namespace) ---
+
+async def decompose_query_node(state: AgentState):
+    """Calls Agent 1's internal decomposition tool."""
+    print("\n--- Running Node: Decompose Query ---")
+    if not agent_1_client: raise ConnectionError("Agent 1 client not available.")
+    user_message = next((msg for msg in reversed(state["messages"]) if isinstance(msg, HumanMessage)), state["messages"][-1] if state["messages"] else None)
+    if not user_message: return {"messages": [AIMessage(content="Error: No query found.")]}
+    original_query = user_message.content
+    print(f"Original Query: {original_query}")
     try:
-        with db_engine.connect() as conn:
-            # Step 1: Enable the pgvector extension
-            conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector;"))
-            
-            # Step 2: Create the table as per the specified schema
-            # We use "IF NOT EXISTS" to make this function idempotent
-            table_creation_query = text(f"""
-            CREATE TABLE IF NOT EXISTS {TABLE_NAME} (
-                chunk_id UUID PRIMARY KEY,
-                document_id UUID,
-                source_url TEXT,
-                timestamp TIMESTAMPTZ,
-                text_content TEXT,
-                keywords TEXT[],
-                embedding_vector VECTOR({EMBEDDING_DIM})
-            );
-            """)
-            conn.execute(table_creation_query)
-            
-            # Step 3: Create an index for vector search (HNSW or IVFFlat)
-            # This is crucial for performance.
-            conn.execute(text(f"""
-            CREATE INDEX IF NOT EXISTS idx_hnsw_embedding
-            ON {TABLE_NAME}
-            USING hnsw (embedding_vector vector_l2_ops);
-            """))
-            # Commit the transaction
-            conn.commit()
-        print(f"[Agent 2] Database setup complete. Table '{TABLE_NAME}' is ready.")
-    except Exception as e:
-        print(f"[Agent 2] ERROR during database setup: {e}")
-        print("Please ensure the PostgreSQL user 'vectoruser' has permissions to CREATE.")
+        # CALL WITH NAMESPACE
+        sub_tasks = await agent_1_client.call("Coordinator_Tools.query_decomposition_tool", user_query=original_query)
+        print(f"Decomposed Tasks: {sub_tasks}")
+        if not isinstance(sub_tasks, list) or not all(isinstance(t, str) for t in sub_tasks): sub_tasks = [str(sub_tasks)]
+        return {"original_query": original_query, "sub_tasks": sub_tasks, "completed_tasks": [], "task_results": {}}
+    except Exception as e: return {"messages": [AIMessage(content=f"Error during decomposition: {e}")]}
+
+def process_tool_results_node(state: AgentState):
+    """Processes the output of the tool node and updates the state."""
+    print("\n--- Running Node: Process Tool Results ---")
+    # --- (Implementation is the same as before - relies on supervisor logic) ---
+    messages = state["messages"]; last_message = messages[-1]
+    if not isinstance(last_message, ToolMessage): return {}
+    tool_call_id = last_message.tool_call_id; tool_content = last_message.content
+    tool_name = "unknown_tool"; tool_args = {}
+    for msg in reversed(messages[:-1]):
+        if isinstance(msg, AIMessage) and msg.tool_calls:
+            for tc in msg.tool_calls:
+                if tc['id'] == tool_call_id: tool_name = tc.get('name', 'unknown'); tool_args = tc.get('args', {}); break
+            if tool_name != "unknown_tool": break
+    print(f"Processing result for tool: {tool_name}")
+    sub_tasks = state.get("sub_tasks", []); completed_tasks = state.get("completed_tasks", [])
+    pending_tasks = [t for t in sub_tasks if t not in completed_tasks]
+    current_task = pending_tasks[0] if pending_tasks else "general_results"
+    updated_task_results = state['task_results'].copy()
+    current_results_list = updated_task_results.get(current_task, [])
+    if not isinstance(current_results_list, list): current_results_list = [current_results_list]
+    current_results_list.append({"tool_called": tool_name, "tool_args": tool_args, "tool_result": tool_content})
+    updated_task_results[current_task] = current_results_list
+    print(f"Stored result under task: {current_task}")
+    # Let supervisor decide on completion, only return results
+    return {"task_results": updated_task_results}
+    # --- (End of process_tool_results_node) ---
+
+def final_synthesis_answer_node(state: AgentState):
+    """Extracts the final synthesis report from the last ToolMessage."""
+    print("\n--- Running Node: Final Synthesis Answer ---")
+    # --- (Implementation is the same as before) ---
+    messages = state["messages"]; last_message = messages[-1]
+    if isinstance(last_message, ToolMessage):
+        tool_call_id = last_message.tool_call_id
+        for msg in reversed(messages[:-1]):
+             if isinstance(msg, AIMessage) and msg.tool_calls:
+                  if any(tc['id'] == tool_call_id and tc['name'] == 'result_synthesis_tool' for tc in msg.tool_calls):
+                       print("Synthesis result found.")
+                       return {"messages": [AIMessage(content=str(last_message.content))]} # Ensure content is string
+                  break
+    print("Warning: Final node reached without synthesis result.")
+    last_ai = next((msg for msg in reversed(messages) if isinstance(msg, AIMessage)), None)
+    return {"messages": [last_ai]} if last_ai else {}
+    # --- (End of final_synthesis_answer_node) ---
 
 
-# --- 3. MCP TOOL DEFINITIONS ---
+# --- 5. Build and Compile the Graph (Supervisor and Edges are the same) ---
+async def compile_graph():
+    """Fetches tools and compiles the LangGraph workflow."""
+    print("[Graph Builder] Compiling Coordinator Graph...")
+    all_tools = await get_coordinator_tools()
+    if not all_tools: return None
 
-@mcp.tool()
-def web_scrape_and_ingest(urls: List[str]) -> str:
-    """
-    Tool 1: Scrapes content from URLs, chunks it, extracts keywords,
-    creates embeddings, and stores everything in the PostgreSQL database
-    according to the specified 'deep_research_chunks' schema.
-    """
-    print(f"[Agent 2] Received request to scrape {len(urls)} URLs...")
+    supervisor_llm = ChatOpenAI(model="gpt-4o", temperature=0, api_key=os.getenv("OPENAI_API_KEY"))
+    supervisor_llm_bound = supervisor_llm.bind_tools(all_tools)
 
-    # --- LOAD ---
-    loader = WebBaseLoader(urls)
-    try:
-        docs = loader.load()
-    except Exception as e:
-        print(f"[Agent 2] Error loading URLs: {e}")
-        return f"Error: Failed to load one or more URLs. {e}"
-        
-    if not docs:
-        return "Error: No documents were loaded from the provided URLs."
+    def supervisor_node_func(state: AgentState):
+        """Supervisor LLM decides the next action."""
+        print("\n--- Running Node: Supervisor ---")
+        if "sub_tasks" not in state or state["sub_tasks"] is None: return {"messages": [AIMessage(content="Internal Error: Sub-tasks missing.")]}
+        sub_tasks = state.get("sub_tasks", []); completed_tasks = state.get("completed_tasks", [])
+        pending_tasks = [t for t in sub_tasks if t not in completed_tasks]; all_done = sub_tasks and not pending_tasks
+        if all_done:
+            print("All sub-tasks seem complete by count. Requesting final synthesis.")
+            original_query = state["original_query"]; all_gathered_data = state["task_results"]
+            synthesis_tool_call = {"name": "result_synthesis_tool", "args": {"original_query": original_query, "all_gathered_data": all_gathered_data}, "id": f"synthesis_call_{len(state['messages'])}"}
+            return {"messages": [AIMessage(content="All tasks complete. Synthesizing final report.", tool_calls=[synthesis_tool_call])]}
+        else:
+            supervisor_messages = state['messages'].copy()
+            next_task = pending_tasks[0] if pending_tasks else "None"
+            # Slightly improved prompt for supervisor focus
+            task_status_prompt = f"\n\nSystem Note: Goal='{state['original_query']}'. Sub-tasks={sub_tasks}. Completed={completed_tasks}. Focus on first pending task: '{next_task}'. Review history & tools, decide next action. If task '{next_task}' requires multiple tool calls, call the next logical one. If you believe '{next_task}' is complete based on last tool result, state reasoning clearly and focus on the *next* pending task. If all tasks are done, call 'result_synthesis_tool'."
+            supervisor_messages.append(SystemMessage(content=task_status_prompt))
+            print(f"Supervisor sending {len(supervisor_messages)} messages to LLM...")
+            response = supervisor_llm_bound.invoke(supervisor_messages)
+            print(f"Supervisor received response: {response.content[:100]}..., Tool Calls: {response.tool_calls}")
+            # --- Mark task as complete ONLY if supervisor explicitly says so ---
+            # --- This requires more complex parsing or a dedicated state update ---
+            # --- For now, rely on task count for synthesis trigger ---
+            # --- Add the response to messages ---
+            return {"messages": [response]}
 
-    # --- SPLIT ---
-    text_splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=150)
-    chunks = text_splitter.split_documents(docs)
-    
-    print(f"[Agent 2] Loaded {len(docs)} docs, split into {len(chunks)} chunks.")
+    tool_node = ToolNode(all_tools)
+    graph_builder = StateGraph(AgentState)
+    graph_builder.add_node("decompose", decompose_query_node)
+    graph_builder.add_node("supervisor", supervisor_node_func)
+    graph_builder.add_node("execute_tools", tool_node)
+    graph_builder.add_node("process_results", process_tool_results_node)
+    graph_builder.add_node("final_answer", final_synthesis_answer_node)
 
-    # Prepare data for insertion
-    chunks_to_insert = []
-    
-    # Generate one document_id for all chunks from this scrape/doc batch
-    # (A better approach might be one UUID per URL)
-    
-    # Let's do one UUID per source document
-    doc_id_map = {doc.metadata.get('source'): uuid.uuid4() for doc in docs}
+    graph_builder.set_entry_point("decompose")
+    graph_builder.add_edge("decompose", "supervisor")
+    graph_builder.add_conditional_edges("supervisor", tools_condition, {"tools": "execute_tools", END: END}) # If supervisor decides to end (e.g., error, or maybe implicit finish?)
+    graph_builder.add_edge("execute_tools", "process_results")
+    def after_processing_condition(state: AgentState) -> Literal["supervisor", "final_answer"]:
+        """Check if the last tool executed was the synthesis tool."""
+        print("\n--- Running Edge Logic: After Processing ---")
+        # --- (Implementation is the same as before) ---
+        last_message = state["messages"][-1]
+        if isinstance(last_message, ToolMessage):
+             tool_call_id = last_message.tool_call_id
+             for msg in reversed(state["messages"][:-1]):
+                  if isinstance(msg, AIMessage) and msg.tool_calls:
+                       if any(tc['id'] == tool_call_id and tc['name'] == 'result_synthesis_tool' for tc in msg.tool_calls):
+                            print("Decision: Synthesis tool ran. Go to Final Answer.")
+                            return "final_answer"
+                       break
+        print("Decision: Synthesis not run. Loop back to Supervisor.")
+        return "supervisor"
+        # --- (End of condition logic) ---
+    graph_builder.add_conditional_edges("process_results", after_processing_condition, {"supervisor": "supervisor", "final_answer": "final_answer"})
+    graph_builder.add_edge("final_answer", END)
 
-    for chunk in chunks:
-        text_content = chunk.page_content
-        source_url = chunk.metadata.get('source', 'N/A')
-        document_id = doc_id_map.get(source_url)
-        
-        # Extract keywords
-        keywords_tuples = kw_extractor.extract_keywords(text_content)
-        extracted_keywords = [kw[0].lower() for kw in keywords_tuples]
+    coordinator_graph = graph_builder.compile()
+    print("[Graph Builder] Coordinator graph compiled successfully.")
+    try: print("\nGraph Structure:"); coordinator_graph.get_graph().print_ascii()
+    except Exception as e: print(f"Could not print graph: {e}")
+    return coordinator_graph
 
-        # Prepare entry
-        chunks_to_insert.append({
-            "chunk_id": uuid.uuid4(),
-            "document_id": document_id,
-            "source_url": source_url,
-            "timestamp": datetime.datetime.now(datetime.timezone.utc),
-            "text_content": text_content,
-            "keywords": extracted_keywords,
-        })
-        
-    # --- EMBED & STORE ---
-    # Batch generate embeddings for efficiency
-    all_text_content = [c["text_content"] for c in chunks_to_insert]
-    
-    if not all_text_content:
-        return "No text content found in chunks to process."
-        
-    print(f"[Agent 2] Generating {len(all_text_content)} embeddings...")
-    embeddings = embeddings_model.embed_documents(all_text_content)
-    
-    # Add embeddings to our data
-    for i, chunk_data in enumerate(chunks_to_insert):
-        chunk_data["embedding_vector"] = embeddings[i]
-
-    # Batch insert into PostgreSQL
-    try:
-        with db_engine.connect() as conn:
-            # We must use text() for the INSERT query
-            insert_query = text(f"""
-            INSERT INTO {TABLE_NAME} (
-                chunk_id, document_id, source_url, timestamp, 
-                text_content, keywords, embedding_vector
-            ) VALUES (
-                :chunk_id, :document_id, :source_url, :timestamp, 
-                :text_content, :keywords, :embedding_vector
-            )
-            """)
-            
-            # Execute the batch insertion
-            conn.execute(insert_query, chunks_to_insert)
-            conn.commit()
-            
-    except Exception as e:
-        error_msg = f"Error: Database insertion failed. {e}"
-        print(f"[Agent 2] {error_msg}")
-        return error_msg
-
-    success_message = f"Successfully scraped, processed, and ingested content. Added {len(chunks)} new chunks to the '{TABLE_NAME}' table."
-    print(f"[Agent 2] {success_message}")
-    return success_message
-
-
-@mcp.tool()
-def semantic_search_tool(query: str, k: int = 4) -> List[Dict[str, Any]]:
-    """
-    Tool 2: Performs a semantic (vector) similarity search against the
-    PostgreSQL 'embedding_vector' column.
-    """
-    print(f"[Agent 2] Performing semantic search for: '{query}'")
-    
-    # 1. Generate the query embedding
-    try:
-        query_embedding = embeddings_model.embed_query(query)
-    except Exception as e:
-        return [{"error": f"Failed to embed query: {e}"}]
-
-    # 2. Execute the vector search query
-    # We use the <-> (L2 distance) operator from pgvector
-    search_query = text(f"""
-    SELECT 
-        text_content, 
-        source_url, 
-        (embedding_vector <-> :query_embedding) AS similarity
-    FROM {TABLE_NAME}
-    ORDER BY similarity
-    LIMIT :k
-    """)
-    
-    try:
-        with db_engine.connect() as conn:
-            results = conn.execute(search_query, {
-                "query_embedding": query_embedding,
-                "k": k
-            })
-            
-            formatted_results = [
-                {
-                    "text_content": row.text_content,
-                    "source": row.source_url,
-                    "similarity_score": row.similarity
-                } for row in results.mappings() # Use .mappings() to get dict-like rows
-            ]
-            
-        print(f"[Agent 2] Found {len(formatted_results)} semantic results.")
-        return formatted_results
-        
-    except Exception as e:
-        error_msg = f"Error during semantic search: {e}"
-        print(f"[Agent 2] {error_msg}")
-        return [{"error": error_msg}]
-
-
-@mcp.tool()
-def keyword_search_tool(query: str, limit: int = 5) -> List[Dict[str, Any]]:
-    """
-    Tool 3: Performs a keyword search against the 'keywords' TEXT[]
-    array column in the PostgreSQL database.
-    """
-    print(f"[Agent 2] Performing keyword search for: '{query}'")
-    
-    # Split query into unique keywords
-    query_keywords = list(set(query.lower().split()))
-    
-    # 2. Execute the array overlap query
-    # We use the && (overlap) operator for PostgreSQL arrays
-    search_query = text(f"""
-    SELECT 
-        text_content, 
-        source_url, 
-        keywords
-    FROM {TABLE_NAME}
-    WHERE keywords && :query_keywords
-    LIMIT :limit
-    """)
-    
-    try:
-        with db_engine.connect() as conn:
-            results = conn.execute(search_query, {
-                "query_keywords": query_keywords,
-                "limit": limit
-            })
-            
-            formatted_results = [
-                {
-                    "text_content": row.text_content,
-                    "source": row.source_url,
-                    "matching_keywords": [kw for kw in row.keywords if kw in query_keywords]
-                } for row in results.mappings()
-            ]
-
-        print(f"[Agent 2] Found {len(formatted_results)} keyword results.")
-        return formatted_results
-
-    except Exception as e:
-        error_msg = f"Error during keyword search: {e}"
-        print(f"[Agent 2] {error_msg}")
-        return [{"error": error_msg}]
-
-
-# --- 4. RUN THE MCP SERVER ---
-
-if __name__ == "__main__":
-    print("Setting up database...")
-    setup_database()
-    
-    print("Starting Agent 2 (RAG & Web) MCP Tool Server...")
-    # Run on port 8001 (or any port not used by other agents)
-    mcp.run(transport="streamable-http", port=8001)
+if __name__ == '__main__':
+    async def test_graph_compilation(): graph = await compile_graph()
+    print("Graph builder defined. Import 'compile_graph'.")
+    import asyncio
+    asyncio.run(test_graph_compilation())

@@ -1,132 +1,172 @@
-# --- tools/file_proc_tools.py ---
+# --- tools/code_discovery_tools.py ---
 
 from typing import List, Dict, Any
 from services.llm_service import LLMService
 import json
 
-# Define MAX_CONTENT_FOR_PROMPT if passing multiple file contents
+# Define MAX_CHUNKS_FOR_PROMPT
+MAX_CHUNKS_FOR_PROMPT = 50 # Limit number of chunks processed at once
 MAX_CONTENT_FOR_PROMPT = 50000 # Limit total characters sent
 
-async def extract_code_elements(filename: str, file_content: str, llm: LLMService) -> List[Dict[str, Any]]:
-    """ Uses LLM to extract functions, classes, and roles from a single file's content. """
-    print(f"[File Proc Tool] Extracting elements from: {filename}")
-    if len(file_content) > MAX_CONTENT_FOR_PROMPT:
-        print(f"Warning: Content for {filename} truncated for element extraction.")
-        file_content = file_content[:MAX_CONTENT_FOR_PROMPT] + "\n... [TRUNCATED]"
+async def chunk_code_semantically(filename: str, file_content: str, llm: LLMService) -> List[Dict[str, Any]]:
+    """ Uses LLM to chunk a single file's content into logical structures (functions, classes, etc.). """
+    print(f"[Code Discovery Tool] Semantically chunking: {filename}")
+    if len(file_content) > MAX_CONTENT_FOR_PROMPT * 2: # Allow more for chunking
+        print(f"Warning: Content for {filename} truncated for semantic chunking.")
+        file_content = file_content[:MAX_CONTENT_FOR_PROMPT * 2] + "\n... [TRUNCATED]"
 
     prompt = (
-        f"Analyze the following source code from the file '{filename}':\n```\n{file_content}\n```\n\n"
-        f"Identify all major functions, classes, methods, or important configuration blocks. "
-        f"For each element, provide its name, type (function, class, method, config), start line number (approximate if necessary), and a concise one-sentence description of its purpose. "
-        f"Return the result as a JSON list of objects, each with keys: 'name', 'type', 'start_line', 'description'."
+        f"Analyze the source code from '{filename}':\n```\n{file_content}\n```\n\n"
+        f"Divide the code into meaningful semantic chunks based on logical units like functions, classes, methods, distinct configuration blocks, or important standalone scripts/paragraphs. "
+        f"For each chunk, provide: \n"
+        f"- 'type': (e.g., 'function', 'class', 'method', 'config_block', 'script_block', 'comment_block')\n"
+        f"- 'name': (Name of the function/class if applicable, or a generated name like 'ConfigBlock1')\n"
+        f"- 'start_line': Approximate starting line number.\n"
+        f"- 'end_line': Approximate ending line number.\n"
+        f"- 'content': The actual code content of the chunk.\n"
+        f"- 'summary': A concise one-sentence summary of the chunk's purpose.\n\n"
+        f"Return the result as a JSON list of chunk objects."
     )
     response = await llm.aask(prompt)
     try:
-        elements = json.loads(response)
-        # Add filename back to each element for context
-        for el in elements:
-            el['file'] = filename
-        return elements
+        chunks = json.loads(response)
+        # Add filename to each chunk
+        for chunk in chunks:
+            chunk['file'] = filename
+        return chunks
     except json.JSONDecodeError:
-        print(f"Warning: Could not parse JSON for elements in {filename}, returning raw.")
-        return [{"file": filename, "llm_raw_response": response}]
+        print(f"Warning: Could not parse JSON for semantic chunks in {filename}, returning raw.")
+        # Try to create a single chunk as fallback
+        return [{"file": filename, "type": "file", "name": filename, "start_line": 1, "end_line": file_content.count('\n')+1, "content": file_content, "summary": "Could not parse chunks.", "llm_raw_response": response}]
     except Exception as e:
-         print(f"Error parsing elements for {filename}: {e}")
+         print(f"Error parsing semantic chunks for {filename}: {e}")
          return [{"file": filename, "error": str(e), "llm_raw_response": response}]
 
 
-async def extract_dependencies(filename: str, file_content: str, llm: LLMService) -> Dict[str, Any]:
-    """ Uses LLM to identify dependencies (imports, requires) in a single file's content. """
-    print(f"[File Proc Tool] Extracting dependencies from: {filename}")
-    if len(file_content) > MAX_CONTENT_FOR_PROMPT:
-        print(f"Warning: Content for {filename} truncated for dependency extraction.")
-        file_content = file_content[:MAX_CONTENT_FOR_PROMPT] + "\n... [TRUNCATED]"
+async def enrich_chunks_with_metadata(chunks: List[Dict[str, Any]], llm: LLMService) -> List[Dict[str, Any]]:
+    """ Uses LLM to add role, dependencies, and business context metadata to chunks. """
+    print(f"[Code Discovery Tool] Enriching {len(chunks)} chunks with metadata...")
+
+    # Process chunks in batches to avoid overly long prompts
+    enriched_chunks_all = []
+    chunks_batch = chunks[:MAX_CHUNKS_FOR_PROMPT] # Process first batch
+    if len(chunks) > MAX_CHUNKS_FOR_PROMPT:
+         print(f"Warning: Processing only the first {MAX_CHUNKS_FOR_PROMPT} chunks for enrichment.")
+
+    # Prepare simplified chunk representation for prompt
+    prompt_chunks = []
+    for i, chunk in enumerate(chunks_batch):
+        prompt_chunks.append({
+            "id": i, # Add an ID for mapping results back
+            "file": chunk.get('file', 'unknown'),
+            "type": chunk.get('type', 'unknown'),
+            "name": chunk.get('name', 'unknown'),
+            "summary": chunk.get('summary', ''),
+            "content_preview": chunk.get('content', '')[:300] + "..." # Send only a preview
+        })
 
     prompt = (
-        f"Analyze the following source code from '{filename}':\n```\n{file_content}\n```\n\n"
-        f"List all imported libraries, modules, or external dependencies mentioned (e.g., 'import requests', 'require(\"express\")'). "
-        f"If possible, include version numbers if specified nearby. "
-        f"Return a JSON object with the key 'dependencies' containing a list of strings."
+        f"Analyze the following code chunks:\n{json.dumps(prompt_chunks, indent=2)}\n\n"
+        f"For each chunk (identified by 'id'), determine its primary 'code_role' (e.g., 'API Endpoint', 'Business Logic', 'Data Model', 'Utility Function', 'Configuration', 'Testing', 'Documentation'). "
+        f"Also, list its main 'dependencies' (key libraries or other internal modules it seems to rely on based on its content/summary). "
+        f"Finally, provide a very brief 'business_context' (1 sentence explaining its likely relevance or risk from a business/product perspective, e.g., 'Handles user authentication', 'Core calculation engine', 'Test utility with no direct impact').\n\n"
+        f"Return a JSON list where each object contains 'id' and the new keys: 'code_role', 'dependencies' (list of strings), 'business_context'."
     )
     response = await llm.aask(prompt)
     try:
-        # Expecting format like {"dependencies": ["requests", "os", "fastapi==0.1.0"]}
-        deps = json.loads(response)
-        # Add filename for context
-        deps['file'] = filename
-        return deps
+        enrichment_data = json.loads(response)
+        # Merge enrichment data back into original chunks based on id
+        enrichment_map = {item['id']: item for item in enrichment_data if 'id' in item}
+
+        for i, chunk in enumerate(chunks_batch):
+            if i in enrichment_map:
+                chunk['code_role'] = enrichment_map[i].get('code_role', 'Unknown')
+                chunk['dependencies'] = enrichment_map[i].get('dependencies', [])
+                chunk['business_context'] = enrichment_map[i].get('business_context', 'N/A')
+            else: # Handle missing enrichment
+                chunk['code_role'] = 'Error'
+                chunk['dependencies'] = []
+                chunk['business_context'] = 'Failed to enrich.'
+        enriched_chunks_all.extend(chunks_batch)
+
+        # Handle remaining chunks if any (could add loop here for full processing)
+        if len(chunks) > MAX_CHUNKS_FOR_PROMPT:
+             print("Skipping enrichment for remaining chunks.")
+             enriched_chunks_all.extend(chunks[MAX_CHUNKS_FOR_PROMPT:]) # Add unprocessed chunks
+
+        return enriched_chunks_all
+
     except json.JSONDecodeError:
-        print(f"Warning: Could not parse JSON for dependencies in {filename}, returning raw.")
-        # Try a simple split as fallback
-        deps_list = [d.strip() for d in response.split('\n') if d.strip() and not d.strip().startswith('{')]
-        return {"file": filename, "dependencies": deps_list, "llm_raw_response": response}
+        print("Warning: Could not parse JSON for enrichment, returning original chunks.")
+        return chunks # Return original chunks if parsing fails
     except Exception as e:
-         print(f"Error parsing dependencies for {filename}: {e}")
-         return {"file": filename, "error": str(e), "llm_raw_response": response}
+         print(f"Error during chunk enrichment: {e}")
+         # Add error markers to chunks
+         for chunk in chunks_batch:
+              chunk['code_role'] = 'Error'; chunk['dependencies'] = []; chunk['business_context'] = f'Enrichment failed: {e}'
+         return chunks
 
 
-async def extract_file_relationships(filenames: List[str], file_contents: Dict[str, str], llm: LLMService) -> List[Dict[str, Any]]:
-    """
-    Uses LLM to identify relationships (imports, calls) between multiple files based on their content.
-    Expects a dictionary mapping filenames to their content.
-    """
-    print(f"[File Proc Tool] Extracting relationships between {len(filenames)} files...")
+async def generate_persona_insights(chunks: List[Dict[str, Any]], llm: LLMService, persona: str) -> List[Dict[str, Any]]:
+    """ Uses LLM to generate persona-specific insights (SDE, PM) for enriched chunks. """
+    print(f"[Code Discovery Tool] Generating insights for persona: {persona} on {len(chunks)} chunks...")
 
-    # Prepare content for prompt, limiting total size
-    prompt_content = ""
-    total_len = 0
-    included_files = []
-    for fname in filenames:
-        content = file_contents.get(fname, "")
-        if not content: continue
-        segment = f"\n--- File: {fname} ---\n```\n{content[:5000]}...\n```\n" # Limit content per file
-        if total_len + len(segment) > MAX_CONTENT_FOR_PROMPT * 2: # Allow slightly more for relationships
-             print(f"Warning: Stopping relationship analysis early due to total content length limit.")
-             break
-        prompt_content += segment
-        total_len += len(segment)
-        included_files.append(fname)
+    # Process in batches
+    persona_chunks_all = []
+    chunks_batch = chunks[:MAX_CHUNKS_FOR_PROMPT]
+    if len(chunks) > MAX_CHUNKS_FOR_PROMPT:
+         print(f"Warning: Processing only first {MAX_CHUNKS_FOR_PROMPT} chunks for persona insights.")
 
-    if not included_files:
-        return [{"error": "No content provided for relationship analysis."}]
+    # Prepare simplified chunk representation
+    prompt_chunks = []
+    for i, chunk in enumerate(chunks_batch):
+        prompt_chunks.append({
+            "id": i,
+            "file": chunk.get('file', '?'),
+            "type": chunk.get('type', '?'),
+            "name": chunk.get('name', '?'),
+            "summary": chunk.get('summary', '?'),
+            "code_role": chunk.get('code_role', '?'),
+            "dependencies": chunk.get('dependencies', []),
+            "business_context": chunk.get('business_context', '?'),
+        })
+
+    # Persona-specific instructions
+    if persona.lower() == 'sde':
+        persona_instructions = "Focus on technical details: complexity, dependencies, potential refactoring needs, testing implications, and integration points relevant to a Software Development Engineer."
+    elif persona.lower() == 'pm':
+        persona_instructions = "Focus on product/business implications: user features, business logic, potential risks/impact on roadmap, areas needing clarification, and alignment with product goals relevant to a Product Manager."
+    else:
+        persona_instructions = "Provide a general overview of the chunk's relevance."
 
     prompt = (
-        f"Analyze the relationships between the following code files based on their content. "
-        f"Identify which files import or call functions/classes from other files within this list. "
-        f"Focus on direct dependencies revealed by import statements or function/method calls.\n"
-        f"{prompt_content}\n\n"
-        f"Return the relationships as a JSON list of objects, each with keys: "
-        f"'source_file' (the file doing the importing/calling), "
-        f"'target_file' (the file being imported/called), "
-        f"'type' (e.g., 'import', 'function_call', 'class_instantiation'), "
-        f"and 'details' (e.g., the specific function/class name involved)."
+        f"Analyze the following enriched code chunks from the perspective of a '{persona}'.\n"
+        f"{json.dumps(prompt_chunks, indent=2)}\n\n"
+        f"For each chunk (identified by 'id'), provide a concise 'persona_insight' (1-2 sentences) explaining its relevance and key takeaways for this persona. {persona_instructions}\n\n"
+        f"Return a JSON list where each object contains only 'id' and 'persona_insight'."
     )
     response = await llm.aask(prompt)
     try:
-        relationships = json.loads(response)
-        return relationships
+        insight_data = json.loads(response)
+        insight_map = {item['id']: item.get('persona_insight', 'N/A') for item in insight_data if 'id' in item}
+
+        # Add insights back to the original chunks
+        for i, chunk in enumerate(chunks_batch):
+            chunk[f'insight_{persona.lower()}'] = insight_map.get(i, 'Failed to generate insight.')
+        persona_chunks_all.extend(chunks_batch)
+
+        if len(chunks) > MAX_CHUNKS_FOR_PROMPT:
+             print("Skipping persona insights for remaining chunks.")
+             persona_chunks_all.extend(chunks[MAX_CHUNKS_FOR_PROMPT:])
+
+        return persona_chunks_all
+
     except json.JSONDecodeError:
-        print("Warning: Could not parse JSON for relationships, returning raw.")
-        return [{"llm_raw_response": response}]
+        print(f"Warning: Could not parse JSON for persona insights ({persona}), adding raw.")
+        # Add raw response as insight to first chunk as fallback
+        if chunks_batch: chunks_batch[0][f'insight_{persona.lower()}'] = f"Raw LLM Response: {response}"
+        return chunks # Return original chunks
     except Exception as e:
-         print(f"Error parsing relationships: {e}")
-         return [{"error": str(e), "llm_raw_response": response}]
-
-# get_skip_patterns can be simpler - maybe move to repo_intel_tools?
-# Let's keep it here for now as file processing might reveal more candidates.
-async def suggest_skip_patterns(files: List[str], llm: LLMService) -> List[str]:
-    """ Uses LLM to suggest additional directories/files to skip based on patterns seen. """
-    print("[File Proc Tool] Suggesting skip patterns...")
-    files_sample = files[:MAX_FILES_FOR_PROMPT]
-    prompt = (
-        f"Based on this file list:\n{json.dumps(files_sample, indent=2)}\n\n"
-        f"Are there any other common patterns for directories or file types that should typically be excluded from analysis "
-        f"(e.g., build artifacts, logs, compiled code, large assets)? List potential patterns (like '*.log', 'temp/')."
-    )
-    response = await llm.aask(prompt)
-    # Basic parsing
-    try:
-        patterns = [p.strip() for p in response.split('\n') if p.strip() and not p.strip().startswith('{')]
-        return patterns
-    except Exception:
-        return [response]
+         print(f"Error during persona insight generation ({persona}): {e}")
+         for chunk in chunks_batch: chunk[f'insight_{persona.lower()}'] = f'Insight generation failed: {e}'
+         return chunks

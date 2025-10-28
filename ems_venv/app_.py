@@ -1,80 +1,93 @@
-# --- agents/file_proc_agent.py ---
+# --- agents/code_discovery_agent.py ---
 
 import os
 from typing import Dict, Any, List
-from tools.file_proc_tools import (
-    extract_code_elements,
-    extract_dependencies,
-    extract_file_relationships,
-    suggest_skip_patterns,
+from tools.code_discovery_tools import (
+    chunk_code_semantically,
+    enrich_chunks_with_metadata,
+    generate_persona_insights,
 )
-# Need the tool to read file content
+# Need file reading tool if chunking happens here
 from tools.repo_intel_tools import read_file_content
 from services.llm_service import LLMService
-import asyncio # For running tools concurrently
+import asyncio
+import json # For handling chunk data
 
-# Limit how many files to process in detail to avoid excessive cost/time
-MAX_FILES_TO_PROCESS = 50
+# Limit how many files to chunk/process
+MAX_FILES_FOR_SEMANTIC_CHUNK = 20
 
-class FileProcessingAgent:
-    """ Agent for file-level analysis: extracts elements, dependencies, relationships. """
+class CodeDiscoveryAgent:
+    """ Agent for semantic chunking, metadata enrichment, and persona insights. """
 
     def __init__(self, llm_api_key: str | None = None):
         self.llm = LLMService(api_key=llm_api_key)
 
     async def process(self, state: Dict[str, Any]) -> Dict[str, Any]:
-        """ Runs the file processing tools on relevant files. """
-        print("\n--- Running File Processing Agent ---")
+        """ Runs semantic chunking and analysis tools. """
+        print("\n--- Running Code Discovery Agent ---")
         project_path = state.get("project_path")
+        # Use files identified by repo intel, maybe filtered by file proc?
         repo_files = state.get("repo_files", [])
+        personas = state.get("personas", ["SDE", "PM"]) # Get target personas from state
 
         if not project_path or not repo_files:
             print("Error: project_path or repo_files missing from state.")
-            state["file_proc_error"] = "Project path or file list missing."
+            state["code_discovery_error"] = "Project path or file list missing."
             return state
 
-        # Select a subset of files for detailed processing
-        files_to_process = repo_files[:MAX_FILES_TO_PROCESS]
-        if len(repo_files) > MAX_FILES_TO_PROCESS:
-            print(f"Warning: Processing details for first {MAX_FILES_TO_PROCESS} files only.")
+        # --- Semantic Chunking ---
+        # Select files to chunk (e.g., source code files identified earlier)
+        # For simplicity, let's chunk a subset of the repo files
+        files_to_chunk = repo_files[:MAX_FILES_FOR_SEMANTIC_CHUNK]
+        if len(repo_files) > MAX_FILES_FOR_SEMANTIC_CHUNK:
+             print(f"Warning: Semantically chunking first {MAX_FILES_FOR_SEMANTIC_CHUNK} files only.")
 
-        # --- Read file contents ---
-        file_contents: Dict[str, str] = {}
-        print(f"Reading content for {len(files_to_process)} files...")
-        for rel_path in files_to_process:
-            file_contents[rel_path] = read_file_content(project_path, rel_path) # Sync read
-
-        # --- Run tools concurrently where possible ---
-        print("Extracting code elements, dependencies...")
-        element_tasks = []
-        dependency_tasks = []
-        for rel_path in files_to_process:
-            content = file_contents.get(rel_path, "")
+        print(f"Starting semantic chunking for {len(files_to_chunk)} files...")
+        chunking_tasks = []
+        for rel_path in files_to_chunk:
+            # Read content specifically for chunking
+            content = read_file_content(project_path, rel_path)
             if content and not content.startswith("Error:"):
-                element_tasks.append(extract_code_elements(rel_path, content, self.llm))
-                dependency_tasks.append(extract_dependencies(rel_path, content, self.llm))
+                 chunking_tasks.append(chunk_code_semantically(rel_path, content, self.llm))
+            else:
+                 print(f"Skipping chunking for {rel_path} due to read error or binary content.")
 
-        # Run relationship analysis (needs multiple files)
-        relationship_task = extract_file_relationships(files_to_process, file_contents, self.llm)
+        # Gather all chunks
+        chunk_results = await asyncio.gather(*chunking_tasks)
+        all_chunks = [chunk for sublist in chunk_results for chunk in sublist if not sublist[0].get("error")]
+        print(f"Generated {len(all_chunks)} semantic chunks.")
 
-        # Run skip pattern suggestion
-        skip_pattern_task = suggest_skip_patterns(repo_files, self.llm) # Use full list here
+        if not all_chunks:
+             state["semantic_chunks"] = []
+             state["persona_insights"] = {}
+             print("No semantic chunks generated.")
+             print("--- Finished Code Discovery Agent ---")
+             return state
 
-        # Gather results
-        code_elements_results = await asyncio.gather(*element_tasks)
-        dependencies_results = await asyncio.gather(*dependency_tasks)
-        file_relationships = await relationship_task
-        skip_patterns = await skip_pattern_task
+        # --- Enrich Chunks ---
+        print("Enriching chunks with metadata...")
+        enriched_chunks = await enrich_chunks_with_metadata(all_chunks, self.llm)
 
-        # Flatten list of lists for elements
-        all_code_elements = [element for sublist in code_elements_results for element in sublist if not sublist[0].get("error")]
+        # --- Generate Persona Insights ---
+        print(f"Generating insights for personas: {personas}...")
+        # Start with enriched chunks
+        chunks_for_persona = enriched_chunks
+        persona_outputs = {}
+        # Apply insights sequentially or concurrently if desired
+        for persona in personas:
+            chunks_with_persona_insight = await generate_persona_insights(chunks_for_persona, self.llm, persona)
+            # Update the main list of chunks for the next persona (optional)
+            # chunks_for_persona = chunks_with_persona_insight
+            # Store final result keyed by persona
+            persona_outputs[persona] = chunks_with_persona_insight # Store the chunks with insights
 
-        # Update state
-        state["file_contents"] = file_contents # Store contents if needed downstream
-        state["code_elements"] = all_code_elements
-        state["dependencies"] = dependencies_results # List of dicts per file
-        state["file_relationships"] = file_relationships
-        state["suggested_skip_patterns"] = skip_patterns
+        # Update state with final results
+        # Store the enriched chunks *with* the final persona insights added
+        final_enriched_chunks_with_insights = chunks_with_persona_insight if personas else enriched_chunks
 
-        print("--- Finished File Processing Agent ---")
+        state["semantic_chunks"] = final_enriched_chunks_with_insights
+        # Optional: Keep persona_outputs separate if needed
+        # state["persona_insights"] = persona_outputs
+
+        print("--- Finished Code Discovery Agent ---")
         return state

@@ -1,171 +1,132 @@
-# --- tools/repo_intel_tools.py ---
+# --- tools/file_proc_tools.py ---
 
 from typing import List, Dict, Any
-from services.llm_service import LLMService # Assumes llm_service.py is in ../services/
-import os
+from services.llm_service import LLMService
 import json
 
-# --- Constants ---
-EXCLUDE_DIRS = {".git", ".vscode", "node_modules", "__pycache__", "dist", "build", "venv", ".venv"}
-MAX_FILE_SIZE_BYTES = 1 * 1024 * 1024 # Skip files larger than 1MB
-MAX_FILES_FOR_PROMPT = 100 # Limit number of files sent in prompts
+# Define MAX_CONTENT_FOR_PROMPT if passing multiple file contents
+MAX_CONTENT_FOR_PROMPT = 50000 # Limit total characters sent
 
-# --- Helper Functions ---
-def is_binary_file(filepath: str) -> bool:
-    """ Basic check if a file appears to be binary. """
-    try:
-        with open(filepath, "rb") as f:
-            chunk = f.read(1024)
-            # Simple check: presence of null bytes often indicates binary
-            if b'\x00' in chunk:
-                return True
-            # Try decoding a small chunk, if it fails, likely binary
-            chunk.decode('utf-8', errors='strict')
-        return False
-    except (IOError, UnicodeDecodeError):
-        return True
-    except Exception: # Catch other potential errors
-        return True # Assume binary on unexpected error
-
-def list_project_files(project_path: str) -> List[str]:
-    """ Recursively collects non-binary, non-excluded files under a size limit. """
-    print(f"[Repo Intel Tool] Listing files in: {project_path}")
-    result = []
-    if not os.path.isdir(project_path):
-        print(f"Error: Provided path '{project_path}' is not a valid directory.")
-        return []
-
-    for root, dirs, files in os.walk(project_path, topdown=True):
-        # Modify dirs in-place to prune excluded directories
-        dirs[:] = [d for d in dirs if d not in EXCLUDE_DIRS]
-
-        for file in files:
-            file_path = os.path.join(root, file)
-            # Use relative path for cleaner prompts
-            relative_path = os.path.relpath(file_path, project_path)
-
-            # Skip excluded dirs/files and large/binary files
-            if any(part in EXCLUDE_DIRS for part in relative_path.split(os.sep)):
-                continue
-            try:
-                if os.path.getsize(file_path) > MAX_FILE_SIZE_BYTES:
-                    print(f"Skipping large file: {relative_path}")
-                    continue
-                if is_binary_file(file_path):
-                    # print(f"Skipping binary file: {relative_path}") # Can be noisy
-                    continue
-                result.append(relative_path)
-            except OSError as e:
-                print(f"Error accessing file {relative_path}: {e}") # Handle permission errors etc.
-
-    print(f"[Repo Intel Tool] Found {len(result)} relevant files.")
-    return result
-
-# --- LLM-Powered Tools ---
-async def detect_tech_stack(files: List[str], llm: LLMService) -> List[str]:
-    """ Uses LLM to guess tech stack based on file list. """
-    print("[Repo Intel Tool] Detecting tech stack...")
-    # Limit file list size for prompt
-    files_sample = files[:MAX_FILES_FOR_PROMPT]
-    if len(files) > MAX_FILES_FOR_PROMPT:
-        print(f"Warning: Truncating file list to {MAX_FILES_FOR_PROMPT} for tech stack detection.")
+async def extract_code_elements(filename: str, file_content: str, llm: LLMService) -> List[Dict[str, Any]]:
+    """ Uses LLM to extract functions, classes, and roles from a single file's content. """
+    print(f"[File Proc Tool] Extracting elements from: {filename}")
+    if len(file_content) > MAX_CONTENT_FOR_PROMPT:
+        print(f"Warning: Content for {filename} truncated for element extraction.")
+        file_content = file_content[:MAX_CONTENT_FOR_PROMPT] + "\n... [TRUNCATED]"
 
     prompt = (
-        f"Based on this list of project file paths, identify the primary programming languages, frameworks, and technologies used. Provide a concise list.\n\n"
-        f"File Paths:\n{json.dumps(files_sample, indent=2)}\n\n"
-        f"Detected Stack (list of strings):"
-    )
-    response = await llm.aask(prompt)
-    # Basic parsing attempt
-    try:
-        # Check if response looks like a list
-        if response.strip().startswith('[') and response.strip().endswith(']'):
-            import ast
-            stack = ast.literal_eval(response.strip())
-            if isinstance(stack, list): return stack
-        # Otherwise, return response split by lines/commas as fallback
-        return [s.strip() for s in response.replace(',', '\n').split('\n') if s.strip()]
-    except Exception:
-        print("Warning: Could not parse tech stack list, returning raw response.")
-        return [response] # Return raw LLM output if parsing fails
-
-async def summarize_structure(files: List[str], llm: LLMService) -> Dict[str, Any]:
-    """ Uses LLM to summarize codebase structure. """
-    print("[Repo Intel Tool] Summarizing structure...")
-    files_sample = files[:MAX_FILES_FOR_PROMPT]
-    if len(files) > MAX_FILES_FOR_PROMPT:
-        print(f"Warning: Truncating file list to {MAX_FILES_FOR_PROMPT} for structure summary.")
-
-    prompt = (
-        f"Analyze this list of project file paths:\n{json.dumps(files_sample, indent=2)}\n\n"
-        f"Identify and categorize the files. Provide a summary in JSON format with keys like "
-        f"'main_entrypoints' (list), 'configuration_files' (list), 'documentation_files' (list), "
-        f"'test_files' (list), 'core_logic_folders' (list), and 'other_notable_files' (list)."
-        f"Value for each key should be a list of relevant file paths."
+        f"Analyze the following source code from the file '{filename}':\n```\n{file_content}\n```\n\n"
+        f"Identify all major functions, classes, methods, or important configuration blocks. "
+        f"For each element, provide its name, type (function, class, method, config), start line number (approximate if necessary), and a concise one-sentence description of its purpose. "
+        f"Return the result as a JSON list of objects, each with keys: 'name', 'type', 'start_line', 'description'."
     )
     response = await llm.aask(prompt)
     try:
-        # LLM should return JSON directly
-        summary = json.loads(response)
-        return summary
+        elements = json.loads(response)
+        # Add filename back to each element for context
+        for el in elements:
+            el['file'] = filename
+        return elements
     except json.JSONDecodeError:
-        print("Warning: Could not parse structure summary JSON, returning raw.")
-        return {"llm_raw_response": response}
+        print(f"Warning: Could not parse JSON for elements in {filename}, returning raw.")
+        return [{"file": filename, "llm_raw_response": response}]
     except Exception as e:
-         print(f"Error parsing structure summary: {e}")
-         return {"error": str(e), "llm_raw_response": response}
+         print(f"Error parsing elements for {filename}: {e}")
+         return [{"file": filename, "error": str(e), "llm_raw_response": response}]
 
-async def compute_architecture(files: List[str], llm: LLMService) -> str:
-    """ Uses LLM for a natural language architecture summary. """
-    print("[Repo Intel Tool] Computing architecture summary...")
-    files_sample = files[:MAX_FILES_FOR_PROMPT]
-    if len(files) > MAX_FILES_FOR_PROMPT:
-        print(f"Warning: Truncating file list to {MAX_FILES_FOR_PROMPT} for architecture summary.")
 
-    prompt = (
-        f"Based on this list of project files:\n{json.dumps(files_sample, indent=2)}\n\n"
-        f"Describe the high-level software architecture. What kind of application is it (e.g., web service, library, CLI)? "
-        f"What are the likely key components or modules and how might they interact? Provide a concise natural language summary."
-    )
-    response = await llm.aask(prompt)
-    return response
-
-async def compute_complexity(files: List[str], llm: LLMService) -> str:
-    """ Uses LLM to estimate project complexity. """
-    print("[Repo Intel Tool] Computing complexity estimate...")
-    files_sample = files[:MAX_FILES_FOR_PROMPT]
-    if len(files) > MAX_FILES_FOR_PROMPT:
-        print(f"Warning: Truncating file list to {MAX_FILES_FOR_PROMPT} for complexity estimate.")
+async def extract_dependencies(filename: str, file_content: str, llm: LLMService) -> Dict[str, Any]:
+    """ Uses LLM to identify dependencies (imports, requires) in a single file's content. """
+    print(f"[File Proc Tool] Extracting dependencies from: {filename}")
+    if len(file_content) > MAX_CONTENT_FOR_PROMPT:
+        print(f"Warning: Content for {filename} truncated for dependency extraction.")
+        file_content = file_content[:MAX_CONTENT_FOR_PROMPT] + "\n... [TRUNCATED]"
 
     prompt = (
-        f"Estimate the overall complexity of a codebase represented by these files:\n{json.dumps(files_sample, indent=2)}\n\n"
-        f"Consider factors like the number of files, variety of languages/technologies, potential interdependencies, and likely project size. "
-        f"Provide a complexity rating (e.g., Low, Medium, High, Very High) and a brief justification."
+        f"Analyze the following source code from '{filename}':\n```\n{file_content}\n```\n\n"
+        f"List all imported libraries, modules, or external dependencies mentioned (e.g., 'import requests', 'require(\"express\")'). "
+        f"If possible, include version numbers if specified nearby. "
+        f"Return a JSON object with the key 'dependencies' containing a list of strings."
     )
     response = await llm.aask(prompt)
-    return response
-
-# --- NEW Tool: Read File Content ---
-def read_file_content(project_path: str, relative_filepath: str) -> str:
-    """ Reads the content of a specific file, given the project root and relative path. """
-    print(f"[Repo Intel Tool] Reading file: {relative_filepath}")
-    full_path = os.path.join(project_path, relative_filepath)
     try:
-        # Check size again just in case
-        if os.path.getsize(full_path) > MAX_FILE_SIZE_BYTES:
-            return f"Error: File is too large (> {MAX_FILE_SIZE_BYTES / 1024 / 1024}MB)."
-        # Check binary again
-        if is_binary_file(full_path):
-             return "Error: Cannot read binary file content."
-
-        with open(full_path, 'r', encoding='utf-8', errors='ignore') as f:
-            content = f.read()
-            # Optional: Truncate very long files if needed for subsequent LLM calls
-            # MAX_CONTENT_LENGTH = 100000 # Example limit
-            # if len(content) > MAX_CONTENT_LENGTH:
-            #     content = content[:MAX_CONTENT_LENGTH] + "\n... [TRUNCATED]"
-            return content
-    except FileNotFoundError:
-        return f"Error: File not found at '{full_path}'."
+        # Expecting format like {"dependencies": ["requests", "os", "fastapi==0.1.0"]}
+        deps = json.loads(response)
+        # Add filename for context
+        deps['file'] = filename
+        return deps
+    except json.JSONDecodeError:
+        print(f"Warning: Could not parse JSON for dependencies in {filename}, returning raw.")
+        # Try a simple split as fallback
+        deps_list = [d.strip() for d in response.split('\n') if d.strip() and not d.strip().startswith('{')]
+        return {"file": filename, "dependencies": deps_list, "llm_raw_response": response}
     except Exception as e:
-        return f"Error reading file '{relative_filepath}': {e}"
+         print(f"Error parsing dependencies for {filename}: {e}")
+         return {"file": filename, "error": str(e), "llm_raw_response": response}
+
+
+async def extract_file_relationships(filenames: List[str], file_contents: Dict[str, str], llm: LLMService) -> List[Dict[str, Any]]:
+    """
+    Uses LLM to identify relationships (imports, calls) between multiple files based on their content.
+    Expects a dictionary mapping filenames to their content.
+    """
+    print(f"[File Proc Tool] Extracting relationships between {len(filenames)} files...")
+
+    # Prepare content for prompt, limiting total size
+    prompt_content = ""
+    total_len = 0
+    included_files = []
+    for fname in filenames:
+        content = file_contents.get(fname, "")
+        if not content: continue
+        segment = f"\n--- File: {fname} ---\n```\n{content[:5000]}...\n```\n" # Limit content per file
+        if total_len + len(segment) > MAX_CONTENT_FOR_PROMPT * 2: # Allow slightly more for relationships
+             print(f"Warning: Stopping relationship analysis early due to total content length limit.")
+             break
+        prompt_content += segment
+        total_len += len(segment)
+        included_files.append(fname)
+
+    if not included_files:
+        return [{"error": "No content provided for relationship analysis."}]
+
+    prompt = (
+        f"Analyze the relationships between the following code files based on their content. "
+        f"Identify which files import or call functions/classes from other files within this list. "
+        f"Focus on direct dependencies revealed by import statements or function/method calls.\n"
+        f"{prompt_content}\n\n"
+        f"Return the relationships as a JSON list of objects, each with keys: "
+        f"'source_file' (the file doing the importing/calling), "
+        f"'target_file' (the file being imported/called), "
+        f"'type' (e.g., 'import', 'function_call', 'class_instantiation'), "
+        f"and 'details' (e.g., the specific function/class name involved)."
+    )
+    response = await llm.aask(prompt)
+    try:
+        relationships = json.loads(response)
+        return relationships
+    except json.JSONDecodeError:
+        print("Warning: Could not parse JSON for relationships, returning raw.")
+        return [{"llm_raw_response": response}]
+    except Exception as e:
+         print(f"Error parsing relationships: {e}")
+         return [{"error": str(e), "llm_raw_response": response}]
+
+# get_skip_patterns can be simpler - maybe move to repo_intel_tools?
+# Let's keep it here for now as file processing might reveal more candidates.
+async def suggest_skip_patterns(files: List[str], llm: LLMService) -> List[str]:
+    """ Uses LLM to suggest additional directories/files to skip based on patterns seen. """
+    print("[File Proc Tool] Suggesting skip patterns...")
+    files_sample = files[:MAX_FILES_FOR_PROMPT]
+    prompt = (
+        f"Based on this file list:\n{json.dumps(files_sample, indent=2)}\n\n"
+        f"Are there any other common patterns for directories or file types that should typically be excluded from analysis "
+        f"(e.g., build artifacts, logs, compiled code, large assets)? List potential patterns (like '*.log', 'temp/')."
+    )
+    response = await llm.aask(prompt)
+    # Basic parsing
+    try:
+        patterns = [p.strip() for p in response.split('\n') if p.strip() and not p.strip().startswith('{')]
+        return patterns
+    except Exception:
+        return [response]

@@ -1,81 +1,58 @@
-# --- crud/crud.py ---
+# --- models/model.py ---
 
-from sqlalchemy.orm import Session
-from models import model # Assuming models.py contains User, Project, Initialisation
-from schema import schemas # Assuming schemas.py contains UserCreate etc.
-from typing import Optional
+from datetime import datetime
+# Use Mapped and mapped_column for modern SQLAlchemy
+from sqlalchemy import Column, Integer, String, ForeignKey, DateTime, Text, func
+from sqlalchemy.orm import relationship, Mapped, mapped_column, declarative_base
+from typing import List, Optional
 
-# --- Existing User Functions ---
-def get_user_by_email(db: Session, email: str) -> Optional[model.User]:
-    return db.query(model.User).filter(model.User.email == email).first()
+Base = declarative_base()
 
-def create_user(db: Session, name: str, email: str, hashed_password: str) -> model.User:
-    db_user = model.User(name=name, email=email, password=hashed_password) # Removed role assumption
-    db.add(db_user)
-    db.commit()
-    db.refresh(db_user)
-    return db_user
+class User(Base):
+    __tablename__ = "users"
 
-# --- Project Functions ---
-def create_project(db: Session, user_id: int, project_name: str, file_name: str, local_path: str) -> model.Project:
-    """ Creates a new project record, now including local_path. """
-    db_project = model.Project(
-        user_id=user_id,
-        project_name=project_name,
-        file_name=file_name,
-        local_path=local_path # Add path here
-    )
-    db.add(db_project)
-    db.commit()
-    db.refresh(db_project)
-    return db_project
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    name: Mapped[str] = mapped_column(String(100), nullable=False)
+    email: Mapped[str] = mapped_column(String(100), unique=True, index=True, nullable=False)
+    password: Mapped[str] = mapped_column(String(255), nullable=False)
+    # role: Mapped[str] = mapped_column(String(20), nullable=False, default="user") # Example default
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
-# --- NEW: Get Project ---
-def get_project_by_id(db: Session, project_id: int) -> Optional[model.Project]:
-    """ Retrieves a project by its ID. """
-    return db.query(model.Project).filter(model.Project.id == project_id).first()
+    # Relationships
+    projects: Mapped[List["Project"]] = relationship("Project", back_populates="user")
+    initialisations: Mapped[List["Initialisation"]] = relationship("Initialisation", back_populates="user") # Added relationship
 
-# --- Initialisation Functions ---
-# (Keep your existing create_initialization function)
-def create_initialization(db: Session, user_id: int, project_id: int, persona: str) -> model.Initialisation:
-    init = model.Initialisation(
-        user_id=user_id,
-        project_id=project_id,
-        persona=persona,
-        status="started" # Initial status
-    )
-    db.add(init)
-    db.commit()
-    db.refresh(init)
-    return init
+class Project(Base):
+    __tablename__ = "projects"
 
-# --- NEW: Update Status ---
-def update_initialization_status(db: Session, init_id: int, status: str, error_msg: Optional[str] = None):
-    """ Updates the status and optionally error message of an Initialisation record. """
-    init = db.query(model.Initialisation).filter(model.Initialisation.id == init_id).first()
-    if init:
-        init.status = status
-        init.error_message = error_msg
-        # updated_at should update automatically via onupdate in model
-        db.commit()
-        db.refresh(init)
-    else:
-        # Log or handle case where init record is not found
-        print(f"Error: Could not find Initialisation with id {init_id} to update status.")
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    user_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id"), nullable=False)
+    project_name: Mapped[str] = mapped_column(String, nullable=False)
+    file_name: Mapped[str] = mapped_column(String, nullable=False) # Or URL for git
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow) # Added created_at
 
-# --- NEW: Store Results ---
-def store_analysis_result(db: Session, init_id: int, result_json: str):
-    """ Stores the JSON results string in the Initialisation record. """
-    init = db.query(model.Initialisation).filter(model.Initialisation.id == init_id).first()
-    if init:
-        init.results = result_json
-        # updated_at should update automatically
-        db.commit()
-        db.refresh(init)
-    else:
-        print(f"Error: Could not find Initialisation with id {init_id} to store results.")
+    # --- NEW: Store the local path where the code is stored ---
+    local_path: Mapped[str] = mapped_column(String, nullable=False)
 
-# --- NEW: Get Initialization ---
-def get_initialization_by_id(db: Session, init_id: int) -> Optional[model.Initialisation]:
-     """ Retrieves an initialization record by ID. """
-     return db.query(model.Initialisation).filter(model.Initialisation.id == init_id).first()
+    # Relationships
+    user: Mapped["User"] = relationship("User", back_populates="projects")
+    initialisations: Mapped[List["Initialisation"]] = relationship("Initialisation", back_populates="project") # Added relationship
+
+class Initialisation(Base):
+    __tablename__ = "initialisations"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    user_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id"), nullable=False)
+    project_id: Mapped[int] = mapped_column(Integer, ForeignKey("projects.id"), nullable=False)
+    persona: Mapped[str] = mapped_column(String, nullable=False) # 'SDE' or 'PM'
+    status: Mapped[str] = mapped_column(String, default="started") # e.g., started, processing, completed, failed
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    # --- NEW: Fields for tracking analysis ---
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    results: Mapped[Optional[str]] = mapped_column(Text, nullable=True) # Store final state JSON
+    error_message: Mapped[Optional[str]] = mapped_column(String(1000), nullable=True) # Store error details
+
+    # Relationships
+    user: Mapped["User"] = relationship("User", back_populates="initialisations")
+    project: Mapped["Project"] = relationship("Project", back_populates="initialisations")

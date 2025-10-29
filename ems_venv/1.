@@ -1,0 +1,86 @@
+now for the next step create the endpoint of start analysis which will take user preferences, for particular projectile id (folder files) and create a config file which is to be used by llms
+
+Here's a FastAPI endpoint that fits your architecture and preferred style. It takes user preferences (analysis depth, verbosity, personas, web search flag, etc.) for a particular project (by project ID or folder), resolves the folder structure, and builds a config file/object for the agents and LLM to use in the graph.
+
+***
+
+### Example: Start Analysis Endpoint
+
+```python
+# routes_start_analysis.py
+
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel, Field
+from typing import List, Optional, Dict, Any
+import os
+
+router = APIRouter()
+
+class AnalysisConfigRequest(BaseModel):
+    project_id: str
+    personas: List[str] = Field(default_factory=list)
+    include_files: Optional[List[str]] = None  # Optional: explicit file list
+    exclude_files: Optional[List[str]] = None
+    enable_web_search: bool = False
+    analysis_depth: str = "light"  # "deep", "mid", "light"
+    verbosity: Optional[str] = "standard"
+    web_search_query: Optional[str] = None
+
+class AnalysisConfigResponse(BaseModel):
+    config: Dict[str, Any]
+
+@router.post("/start-analysis/", response_model=AnalysisConfigResponse)
+async def start_analysis(req: AnalysisConfigRequest):
+    # Resolve the folder based on project_id (implement your own logic)
+    project_path = _resolve_project_path_from_id(req.project_id)
+    if not os.path.isdir(project_path):
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    # List all files recursively if not explicitly provided
+    all_files = []
+    for root, _, files in os.walk(project_path):
+        for file in files:
+            rel_path = os.path.relpath(os.path.join(root, file), project_path)
+            all_files.append(rel_path)
+
+    include_files = req.include_files or all_files
+    exclude_files = req.exclude_files or []
+
+    # Final config structure for use by the analysis agents / graph
+    analysis_config = {
+        "project_path": project_path,
+        "personas": req.personas,
+        "include_files": include_files,
+        "exclude_files": exclude_files,
+        "enable_web_search": req.enable_web_search,
+        "analysis_depth": req.analysis_depth,
+        "verbosity": req.verbosity,
+        "web_search_query": req.web_search_query
+    }
+
+    # Optionally: Save this config somewhere for persistence/tracing if needed
+
+    return AnalysisConfigResponse(config=analysis_config)
+
+def _resolve_project_path_from_id(project_id: str) -> str:
+    # Your project location resolution logic here
+    # Example: "/data/projects/{project_id}/"
+    return f"/data/projects/{project_id}/"
+```
+***
+
+### Key Points:
+- Returns a fully assembled config object (as a JSON response and/or as a config file) tailored for the LLM analysis system.
+- Automatically includes all files unless the user explicitly selects (`include_files`).
+- Exposes flags and options that downstream agents and the graph can use.
+- Plug this endpoint into your FastAPI app and use `config` object as input to your deep graph builder.
+
+***
+
+You can further extend the API model with more user-supplied options as you scale.
+
+Would you like the next step: running the graph or handling the downstream analysis kickoff?
+
+Citations:
+[1] selected_image_1183273465671543608.jpg https://ppl-ai-file-upload.s3.amazonaws.com/web/direct-files/attachments/images/13630366/4f9cc58a-ce3e-4171-b018-ac842d399cd1/selected_image_1183273465671543608.jpg
+[2] selected_image_6213899448013275800.jpg https://ppl-ai-file-upload.s3.amazonaws.com/web/direct-files/attachments/images/13630366/b60230c6-0e05-4434-a195-fca1632eff9b/selected_image_6213899448013275800.jpg

@@ -1,0 +1,118 @@
+now let's create all the tools for the four agents
+
+Here’s a clear set of sample tool modules for each of your four agents. Each is designed to be imported and called by the agents in your pipeline, allowing you to maintain a modular and readable codebase.
+
+***
+
+### 1. `file_proc_tools.py` — Tools for FileAnalysisAgent
+
+```python
+import os
+from typing import List, Dict, Any
+
+def list_project_files(project_path: str) -> List[str]:
+    files = []
+    for root, _, filenames in os.walk(project_path):
+        for fn in filenames:
+            rel_path = os.path.relpath(os.path.join(root, fn), project_path)
+            files.append(rel_path)
+    return files
+
+def read_file_content(project_path: str, rel_path: str) -> str:
+    file_path = os.path.join(project_path, rel_path)
+    try:
+        with open(file_path, encoding="utf-8") as f:
+            return f.read()
+    except Exception:
+        return ""
+
+async def extract_code_elements(file_path: str, content: str, llm) -> List[Dict[str, Any]]:
+    # Use an LLM for deeper chunking and code understanding
+    prompt = f"Analyze this file in detail: {file_path}\n\n{content}\nReturn code elements and their roles as JSON."
+    result = await llm.aask(prompt)
+    import json
+    try:
+        return json.loads(result)
+    except Exception:
+        return []
+```
+
+***
+
+### 2. `duckduckgo_tool.py` — Tool for WebSearchAgent
+
+```python
+import aiohttp
+from typing import List, Dict
+
+class DuckDuckGoTool:
+    async def search(self, query: str) -> List[Dict]:
+        url = f"https://api.duckduckgo.com/?q={query}&format=json"
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as resp:
+                if resp.status != 200:
+                    return []
+                result = await resp.json()
+                out = []
+                for item in result.get("RelatedTopics", []):
+                    if "Text" in item and "FirstURL" in item:
+                        out.append({"text": item["Text"], "url": item["FirstURL"]})
+                return out
+```
+
+***
+
+### 3. `documentation_tool.py` — Tool for DocumentationAgent
+
+```python
+from typing import List, Dict, Any
+from fpdf import FPDF
+
+def summarize_chunks_to_text(file_chunks: List[Dict[str, Any]], web_results: List[Dict] = None) -> str:
+    lines = ["## Codebase Analysis"]
+    for chunk in file_chunks:
+        lines.append(f"\n### {chunk.get('file')}\n{chunk.get('content', '')}")
+    if web_results:
+        lines.append("\n## Relevant Web Results:")
+        for r in web_results:
+            lines.append(f"- {r.get('text')}: {r.get('url')}")
+    return "\n".join(lines)
+
+def generate_pdf_report(summary: str, config: Dict) -> str:
+    pdf = FPDF()
+    pdf.add_page()
+    pdf.set_font("Arial", size=12)
+    for line in summary.split('\n'):
+        pdf.cell(200, 10, txt=line, ln=True)
+    out_path = f"/tmp/{config.get('project_id', 'output')}_report.pdf"
+    pdf.output(out_path)
+    return out_path
+```
+
+***
+
+### 4. `diagram_tool.py` — Tool for DiagramAgent
+
+```python
+from typing import List, Dict, Any
+
+def create_mermaid_diagram(file_chunks: List[Dict[str, Any]], config: Dict) -> str:
+    # Very basic sample for module dependency diagram
+    diagram = ["graph TD"]
+    for chunk in file_chunks:
+        functions = chunk.get("functions", [])
+        for func in functions:
+            for dep in func.get("dependencies", []):
+                diagram.append(f'  {func["name"]} --> {dep}')
+    return "\n".join(diagram) if len(diagram) > 1 else "graph TD\n  No data found"
+```
+
+***
+
+Each file is independent, clear, and ready to be imported into your agent classes. Their interfaces are aligned with your earlier config-driven, async-first design.
+
+Let me know if you want sample agent instantiation code that wires these tools together!
+
+Citations:
+[1] selected_image_1183273465671543608.jpg https://ppl-ai-file-upload.s3.amazonaws.com/web/direct-files/attachments/images/13630366/4f9cc58a-ce3e-4171-b018-ac842d399cd1/selected_image_1183273465671543608.jpg
+[2] selected_image_6213899448013275800.jpg https://ppl-ai-file-upload.s3.amazonaws.com/web/direct-files/attachments/images/13630366/b60230c6-0e05-4434-a195-fca1632eff9b/selected_image_6213899448013275800.jpg

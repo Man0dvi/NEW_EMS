@@ -1,4 +1,52 @@
-Here are the fully refactored key agent files and a simplified semantic search usage pattern according to your request: eliminate the separate semantic_search service, and use a shared `PGVector` vector store instance with `OpenAIEmbeddings` directly in each file.
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel
+from multi_agent_docs.services.llm_service import LLMService
+
+router = APIRouter()
+llm = LLMService(api_key="YOUR_OPENAI_API_KEY")  # Init once, or inject
+
+class SearchRequest(BaseModel):
+    query: str
+    final_state: dict  # Passed from the graph runner or client, includes analysis text
+
+class SearchResponse(BaseModel):
+    answer: str
+
+@router.post("/search", response_model=SearchResponse)
+async def search_endpoint(req: SearchRequest):
+    # Extract and flatten relevant textual context from final_state
+    context_texts = []
+    for key in ["tech_stack", "structure_summary", "architecture_summary", "complexity_assessment", "semantic_chunks"]:
+        val = req.final_state.get(key)
+        if val:
+            if isinstance(val, list):
+                context_texts.append("
+".join(map(str, val)))
+            else:
+                context_texts.append(str(val))
+
+    context = "
+
+".join(context_texts)
+
+    # Compose prompt with context + user query
+    prompt = (
+        f"You are a knowledgeable assistant. Use the following project analysis context to answer the question.
+
+"
+        f"{context}
+
+"
+        f"Question: {req.query}
+Answer:"
+    )
+
+    try:
+        answer = await llm.aask(prompt)  # or use your completion method
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"LLM query failed: {e}")
+
+    return SearchResponse(answer=answer)ere are the fully refactored key agent files and a simplified semantic search usage pattern according to your request: eliminate the separate semantic_search service, and use a shared `PGVector` vector store instance with `OpenAIEmbeddings` directly in each file.
 
 ***
 

@@ -1,115 +1,100 @@
-okay then let's create two files at a time
+now give the agent files
 
-Let's begin by creating the two key files for the orchestration, as you requested:
-
-1. `graph.py`: the analysis graph orchestration which will conditionally run nodes, manage the overall flow, handle pause/resume, and maintain the final state object.
-
-2. `nodes.py`: which will define the individual nodes (agents) such as `FileAnalysisNode` and `WebSearchNode` that perform their specific tasks and update the shared state.
+Here are the two agent files you requested: `file_analysis_agent.py` and `web_search_agent.py`, designed to integrate with the graph and nodes for your configurable multi-agent orchestration.
 
 ***
 
-### 1. graph.py
+### file_analysis_agent.py
 
 ```python
 import asyncio
-from typing import Dict, Any, Optional
+import logging
+from typing import Dict, Any, List
+from multi_agent_docs.services.llm_service import LLMService
+from multi_agent_docs.tools.file_proc_tools import read_file_content, extract_code_elements
+from langchain_core.documents import Document
 
-from nodes import FileAnalysisNode, WebSearchNode
+logger = logging.getLogger(__name__)
 
-class AnalysisGraph:
-    def __init__(self, config: Dict[str, Any]):
-        self.config = config
-        self.state: Dict[str, Any] = {}  # This holds the final state accumulated
-        self._paused = False
-        self._pause_event = asyncio.Event()
-        self._pause_event.set()  # Initially not paused
+class FileAnalysisAgent:
+    def __init__(self, llm_api_key: str = None):
+        self.llm = LLMService(api_key=llm_api_key)
 
-        # Initialize nodes based on config
-        self.file_analysis_node = FileAnalysisNode()
-        self.web_search_node = WebSearchNode() if config.get("enable_web_search") else None
+    async def process(self, state: Dict[str, Any], config: Dict[str, Any]) -> Dict[str, Any]:
+        project_path = state.get("project_path")
+        files_to_analyze: List[str] = config.get("include_files", [])
+        exclude_files: List[str] = config.get("exclude_files", [])
+        analysis_depth = config.get("analysis_depth", "light")
 
-    async def run(self):
-        self._paused = False
-        self._pause_event.set()
+        logger.info("FileAnalysisAgent starting with %d files and depth %s", len(files_to_analyze), analysis_depth)
 
-        try:
-            # Run file analysis node
-            await self._wait_if_paused()
-            self.state = await self.file_analysis_node.run(self.state, self.config)
+        analyzed_chunks = []
 
-            # Conditionally run web search node
-            if self.web_search_node:
-                await self._wait_if_paused()
-                self.state = await self.web_search_node.run(self.state, self.config)
+        for file_path in files_to_analyze:
+            if file_path in exclude_files:
+                logger.info("Skipping excluded file: %s", file_path)
+                continue
 
-        except asyncio.CancelledError:
-            # Graceful cancellation pausing the graph
-            self._paused = True
-            self._pause_event.clear()
-            raise
+            content = read_file_content(project_path, file_path)
+            if not content:
+                logger.warning("No content found for %s", file_path)
+                continue
 
-        return self.state
+            if analysis_depth == "deep":
+                chunks = await extract_code_elements(file_path, content, self.llm)
+            else:
+                chunks = [{"file": file_path, "content": content}]
 
-    async def _wait_if_paused(self):
-        # Wait if paused
-        await self._pause_event.wait()
+            analyzed_chunks.extend(chunks)
 
-    def pause(self):
-        # Clear the event to pause graph run
-        self._paused = True
-        self._pause_event.clear()
-
-    def resume(self):
-        # Set the event to resume graph run
-        self._paused = False
-        self._pause_event.set()
-
-    def is_paused(self) -> bool:
-        return self._paused
+        state["file_analysis_chunks"] = analyzed_chunks
+        logger.info("FileAnalysisAgent completed with %d chunks", len(analyzed_chunks))
+        return state
 ```
 
 ***
 
-### 2. nodes.py
+### web_search_agent.py
 
 ```python
+import logging
 from typing import Dict, Any
+from multi_agent_docs.services.duckduckgo_service import DuckDuckGoService
 
-from agents.file_analysis_agent import FileAnalysisAgent
-from agents.web_search_agent import WebSearchAgent
+logger = logging.getLogger(__name__)
 
-class FileAnalysisNode:
+class WebSearchAgent:
     def __init__(self):
-        self.agent = FileAnalysisAgent()
+        self.duckduckgo = DuckDuckGoService()
 
-    async def run(self, state: Dict[str, Any], config: Dict[str, Any]) -> Dict[str, Any]:
-        # Run file by file analysis, respecting config options
-        state = await self.agent.process(state, config)
-        return state
-
-class WebSearchNode:
-    def __init__(self):
-        self.agent = WebSearchAgent()
-
-    async def run(self, state: Dict[str, Any], config: Dict[str, Any]) -> Dict[str, Any]:
-        # Run web search tool only if enabled by config
-        if not config.get("enable_web_search", False):
+    async def process(self, state: Dict[str, Any], config: Dict[str, Any]) -> Dict[str, Any]:
+        query = config.get("web_search_query")
+        if not query:
+            logger.info("No web search query provided, skipping WebSearchAgent.")
             return state
 
-        state = await self.agent.process(state, config)
+        logger.info("WebSearchAgent searching for: %s", query)
+        results = await self.duckduckgo.search(query)
+        state["web_search_results"] = results
+        logger.info("WebSearchAgent returned %d results", len(results))
         return state
 ```
 
 ***
 
-### Next Steps
+These agent files assume you have existing or upcoming implementations for:
 
-- Implement `FileAnalysisAgent` and `WebSearchAgent` classes in your agents directory (reuse existing logic and integrate config).
-- Update your API endpoints to create an `AnalysisGraph` with user config, run the graph asynchronously.
-- Implement API endpoints to pause/resume by calling graph's `pause()` and `resume()`.
-- Store and return incremental `state` from the graph for UI updates and search queries.
+- `read_file_content` and `extract_code_elements` in `file_proc_tools`.
+- An async DuckDuckGo search service `DuckDuckGoService` with an async `search(query)` function.
+- `LLMService` wrapping your OpenAI calls.
+
+They fit into the graph orchestration as nodes to be run in sequence or parallel depending on config flags.
 
 ***
 
-Would you like me to create the first agent file next (e.g. `file_analysis_agent.py`), or help write the related FastAPI endpoints for this orchestration?
+Would you like next to create:
+
+- The DuckDuckGo search service?
+- The nodes file connecting these agents as graph nodes?
+- Or the orchestration graph logic itself?
 

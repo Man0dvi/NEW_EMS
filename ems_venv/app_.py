@@ -1,20 +1,26 @@
-now give the agent files
+let's restart - give the following agent files :
 
-Here are the two agent files you requested: `file_analysis_agent.py` and `web_search_agent.py`, designed to integrate with the graph and nodes for your configurable multi-agent orchestration.
+1. analyses files by looping over a folder structure, skips unallowed list of files. and provides all of this context to llm which could be queried by user. this takes config files as input as instructions
+
+3- websearch agent - if allowed by user
+
+2- documentation agent- gets state from from previous two agents, creates a doc, exported as pdf
+
+4- diagram agent - use some tool to create visualization using context
+
+Here are the four agent files you requested, implementing the functionality described:
 
 ***
 
-### file_analysis_agent.py
+### 1. FileAnalysisAgent: analyzes files in folder structure, skips unallowed files, builds context
 
 ```python
+import os
 import asyncio
-import logging
 from typing import Dict, Any, List
+
 from multi_agent_docs.services.llm_service import LLMService
 from multi_agent_docs.tools.file_proc_tools import read_file_content, extract_code_elements
-from langchain_core.documents import Document
-
-logger = logging.getLogger(__name__)
 
 class FileAnalysisAgent:
     def __init__(self, llm_api_key: str = None):
@@ -22,79 +28,138 @@ class FileAnalysisAgent:
 
     async def process(self, state: Dict[str, Any], config: Dict[str, Any]) -> Dict[str, Any]:
         project_path = state.get("project_path")
-        files_to_analyze: List[str] = config.get("include_files", [])
+        include_files: List[str] = config.get("include_files", [])
         exclude_files: List[str] = config.get("exclude_files", [])
         analysis_depth = config.get("analysis_depth", "light")
 
-        logger.info("FileAnalysisAgent starting with %d files and depth %s", len(files_to_analyze), analysis_depth)
-
         analyzed_chunks = []
 
-        for file_path in files_to_analyze:
-            if file_path in exclude_files:
-                logger.info("Skipping excluded file: %s", file_path)
-                continue
+        # Walk project path to find files, filter with include/exclude list
+        for root, _, files in os.walk(project_path):
+            for file in files:
+                rel_path = os.path.relpath(os.path.join(root, file), project_path)
+                if include_files and rel_path not in include_files:
+                    continue
+                if rel_path in exclude_files:
+                    continue
 
-            content = read_file_content(project_path, file_path)
-            if not content:
-                logger.warning("No content found for %s", file_path)
-                continue
+                content = read_file_content(project_path, rel_path)
+                if not content:
+                    continue
 
-            if analysis_depth == "deep":
-                chunks = await extract_code_elements(file_path, content, self.llm)
-            else:
-                chunks = [{"file": file_path, "content": content}]
+                if analysis_depth == "deep":
+                    chunks = await extract_code_elements(rel_path, content, self.llm)
+                else:
+                    chunks = [{"file": rel_path, "content": content}]
 
-            analyzed_chunks.extend(chunks)
+                analyzed_chunks.extend(chunks)
 
         state["file_analysis_chunks"] = analyzed_chunks
-        logger.info("FileAnalysisAgent completed with %d chunks", len(analyzed_chunks))
         return state
 ```
 
 ***
 
-### web_search_agent.py
+### 2. WebSearchAgent: conditionally runs DuckDuckGo web searches
 
 ```python
-import logging
 from typing import Dict, Any
 from multi_agent_docs.services.duckduckgo_service import DuckDuckGoService
-
-logger = logging.getLogger(__name__)
 
 class WebSearchAgent:
     def __init__(self):
         self.duckduckgo = DuckDuckGoService()
 
     async def process(self, state: Dict[str, Any], config: Dict[str, Any]) -> Dict[str, Any]:
-        query = config.get("web_search_query")
-        if not query:
-            logger.info("No web search query provided, skipping WebSearchAgent.")
+        if not config.get("enable_web_search"):
             return state
 
-        logger.info("WebSearchAgent searching for: %s", query)
-        results = await self.duckduckgo.search(query)
-        state["web_search_results"] = results
-        logger.info("WebSearchAgent returned %d results", len(results))
+        query = config.get("web_search_query")
+        if query:
+            results = await self.duckduckgo.search(query)
+            state["web_search_results"] = results
+
         return state
 ```
 
 ***
 
-These agent files assume you have existing or upcoming implementations for:
+### 3. DocumentationAgent: generates documentation PDF from state of previous agents
 
-- `read_file_content` and `extract_code_elements` in `file_proc_tools`.
-- An async DuckDuckGo search service `DuckDuckGoService` with an async `search(query)` function.
-- `LLMService` wrapping your OpenAI calls.
+```python
+from typing import Dict, Any
+from multi_agent_docs.services.llm_service import LLMService
+from multi_agent_docs.tools.documentation_tool import generate_pdf_report
 
-They fit into the graph orchestration as nodes to be run in sequence or parallel depending on config flags.
+class DocumentationAgent:
+    def __init__(self, llm_api_key: str = None):
+        self.llm = LLMService(api_key=llm_api_key)
+
+    async def process(self, state: Dict[str, Any], config: Dict[str, Any]) -> Dict[str, Any]:
+        # Collect all relevant context from previous state
+        file_chunks = state.get("file_analysis_chunks", [])
+        web_search_results = state.get("web_search_results", [])
+
+        # Generate a textual summary using LLM if needed, else use raw data
+        prompt = self._build_prompt(file_chunks, web_search_results, config)
+        summary = await self.llm.aask(prompt)
+
+        # Generate PDF report file path
+        pdf_path = generate_pdf_report(summary, config)
+
+        state["documentation_pdf"] = pdf_path
+        return state
+
+    def _build_prompt(self, file_chunks, web_results, config):
+        # Construct a prompt summarizing the context for LLM to generate docs
+        content = ""
+        content += f"Code Analysis Data: {len(file_chunks)} chunks.\n"
+        content += f"Web Search Results: {len(web_results)} entries.\n"
+        content += "Please generate the documentation as per user settings.\n"
+        return content
+```
 
 ***
 
-Would you like next to create:
+### 4. DiagramAgent: makes visualizations from the current analysis state using Mermaid.js
 
-- The DuckDuckGo search service?
-- The nodes file connecting these agents as graph nodes?
-- Or the orchestration graph logic itself?
+```python
+from typing import Dict, Any
+from multi_agent_docs.tools.diagram_tool import create_mermaid_diagram
+
+class DiagramAgent:
+    def __init__(self):
+        pass
+
+    async def process(self, state: Dict[str, Any], config: Dict[str, Any]) -> Dict[str, Any]:
+        # Derive visualization input from current state
+        file_chunks = state.get("file_analysis_chunks", [])
+
+        # Generate mermaid syntax diagram string
+        diagram_syntax = create_mermaid_diagram(file_chunks, config)
+
+        state["mermaid_diagram"] = diagram_syntax
+        return state
+```
+
+***
+
+### Summary
+
+- **FileAnalysisAgent** loops over project files as per configured include/exclude, runs chunk extraction & adds to state.
+- **WebSearchAgent** optionally runs DuckDuckGo search by config, stores results.
+- **DocumentationAgent** produces textual summary + generates PDF report based on the combined state.
+- **DiagramAgent** produces Mermaid.js diagrams from file content context for visualization.
+
+All agents accept and update the same shared state dictionary, forming progressive knowledge to support interactive querying.
+
+***
+
+If you want, I can now help generate:
+
+- Supportive tool files mentioned here (`documentation_tool.py`, `diagram_tool.py`).
+- The API routes to run and control these agents.
+- Or orchestrating graph and nodes files integrating these agents.
+
+Please specify next step.
 

@@ -1,0 +1,104 @@
+look at how file structure is made for current project and user, use the same to be resolved for the start analysis endpoint, 
+
+this endpoint should provide users to select config, it then generates json of this config, and invokes graph_deep and passes it the config file. this starts the flow of the analysis
+
+The endpoint below follows your project's folder and data model conventions (from the screenshots) and enables the user to select analysis depth, verbosity, personas, web search usage, and file inclusion/exclusion. It builds a config JSON, then invokes your `graph_deep` analysis flow using this config.
+
+***
+
+### FastAPI Endpoint: Start Analysis
+
+```python
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel
+from typing import List, Optional, Dict, Any
+import os
+from graph_deep import build_deep_analysis_graph  # Your orchestrator
+from model import CodeAnalysisState  # TypedDict from your model
+import uuid
+
+router = APIRouter()
+
+class StartAnalysisRequest(BaseModel):
+    project_id: str
+    personas: List[str] = []
+    include_files: Optional[List[str]] = None
+    exclude_files: Optional[List[str]] = None
+    enable_web_search: bool = False
+    analysis_depth: str = "light"
+    verbosity: str = "standard"
+    web_search_query: Optional[str] = None
+
+class StartAnalysisResponse(BaseModel):
+    analysis_id: str
+    config: Dict[str, Any]
+    status: str
+
+@router.post("/start-analysis/", response_model=StartAnalysisResponse)
+async def start_analysis(req: StartAnalysisRequest):
+    # Resolve current user's project folder path (example logic, adapt as needed)
+    base_projects_dir = "/data/projects/"  # or from your env/config
+    project_path = os.path.join(base_projects_dir, req.project_id)
+    if not os.path.isdir(project_path):
+        raise HTTPException(status_code=404, detail="Project folder not found for given project_id")
+    
+    # List all files if include_files is not specified
+    all_files = []
+    for root, _, files in os.walk(project_path):
+        for file in files:
+            rel_path = os.path.relpath(os.path.join(root, file), project_path)
+            all_files.append(rel_path)
+    
+    include_files = req.include_files if req.include_files else all_files
+    exclude_files = req.exclude_files if req.exclude_files else []
+
+    # Build final config to use in graph
+    config = {
+        "project_path": project_path,
+        "personas": req.personas,
+        "include_files": include_files,
+        "exclude_files": exclude_files,
+        "enable_web_search": req.enable_web_search,
+        "analysis_depth": req.analysis_depth,
+        "verbosity": req.verbosity,
+        "web_search_query": req.web_search_query
+    }
+
+    # Generate analysis ID for tracking
+    analysis_id = str(uuid.uuid4())
+    
+    # Compile/run the analysis graph flow, passing config file to graph_deep.py
+    try:
+        graph = build_deep_analysis_graph(CodeAnalysisState)
+        # Initial state for the graph (just config at start)
+        initial_state = {**config}
+        # Async run (can move to background task for large projects)
+        final_state = await graph.ainvoke(initial_state)
+        status = "success"
+        # Optionally: save config/final_state somewhere for downloads/tracing
+    except Exception as e:
+        print(f"Error running analysis graph for {analysis_id}: {e}")
+        status = "error"
+    
+    return StartAnalysisResponse(
+        analysis_id=analysis_id,
+        config=config,
+        status=status
+    )
+```
+***
+
+### Features
+
+- Uses the project-based file structure convention.
+- User selects/deselects analysis features, which files to include/exclude, and analysis level.
+- The endpoint builds the config JSON as your graph expects and runs the analysis graph flow.
+- Tracks each analysis invocation (could be used for job status, async updates, etc.).
+
+***
+
+Let me know if you want to generate an async task/job pattern for analysis or add streaming progress!
+
+Citations:
+[1] selected_image_1183273465671543608.jpg https://ppl-ai-file-upload.s3.amazonaws.com/web/direct-files/attachments/images/13630366/4f9cc58a-ce3e-4171-b018-ac842d399cd1/selected_image_1183273465671543608.jpg
+[2] selected_image_6213899448013275800.jpg https://ppl-ai-file-upload.s3.amazonaws.com/web/direct-files/attachments/images/13630366/b60230c6-0e05-4434-a195-fca1632eff9b/selected_image_6213899448013275800.jpg

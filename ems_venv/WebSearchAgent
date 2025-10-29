@@ -1,0 +1,14 @@
+from typing import Dict, Any
+from langchain_community.tools import DuckDuckGoSearchRun
+
+class WebSearchAgent:
+    async def process(self, state: Dict[str, Any], config: Dict[str, Any]) -> Dict[str, Any]:
+        if not config.get("enable_web_search", False):
+            return state
+
+        duckDuckSearch = DuckDuckGoSearchRun()
+        query = config.get("web_search_query") or " ".join(state.get("keywords", []))
+        answer = duckDuckSearch.invoke(query)
+
+        state["web_search_results"] = answer
+        return state

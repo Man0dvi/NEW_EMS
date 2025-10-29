@@ -1,0 +1,22 @@
+from typing import Dict, Any
+from langchain_community.tools import DuckDuckGoSearchRun
+
+class WebSearchAgent:
+    async def process(self, state: Dict[str, Any], config: Dict[str, Any]) -> Dict[str, Any]:
+        if not config.get("enable_web_search", False):
+            return state
+
+        # Instantiate the DuckDuckGo tool (sync .invoke OK if running in threadpool)
+        duckDuckSearch = DuckDuckGoSearchRun()
+
+        query = config.get("web_search_query", "best python code analysis practices")
+        answer = duckDuckSearch.invoke(query)
+
+        # Optionally: inspect tool properties
+        print(f"Tool Name: {duckDuckSearch.name}")
+        print(f"Tool Description: {duckDuckSearch.description}")
+        print(f"Tool Answer: {answer}")
+
+        # Store the result in the shared state for downstream agents to use
+        state["web_search_results"] = answer
+        return state
